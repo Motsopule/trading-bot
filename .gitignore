@@ -22,6 +22,11 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+# Trading bot runtime files
+.env
+risk_state.json
+*.csv
+logs/
 
 # Virtual environments
 venv/
