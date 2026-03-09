@@ -1,0 +1,17 @@
+Cursor-Specific Project Rules:
+
+Follow PEP8 standards for all Python code
+
+Document each function with a clear docstring describing its purpose, inputs, and outputs
+
+Use Git for version control, and regularly commit changes
+
+Run linting (e.g., flake8) on the code to ensure it’s clean and follows standards
+
+Write unit tests for all critical functions (strategy logic, risk management, execution)
+
+Use a .env file for securely storing API keys and avoid exposing them in the code
+
+Implement error handling for common issues like API errors, high volatility, and connection issues
+
+Paper trade for at least 100 simulated trades before live trading

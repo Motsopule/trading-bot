@@ -1,0 +1,8 @@
+{
+  "current_capital": 1000.0,
+  "current_date": "2026-02-24",
+  "daily_pnl": 0.0,
+  "daily_trades": [],
+  "kill_switch_active": false,
+  "kill_switch_reason": null
+}
