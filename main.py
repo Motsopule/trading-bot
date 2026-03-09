@@ -23,6 +23,28 @@ from notifications import TelegramNotifier
 # Load environment variables from project directory (reliable regardless of cwd)
 _env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 load_dotenv(dotenv_path=_env_path)
+
+
+def _mask_key(value: str) -> str:
+    """Mask a key for debug output: show first and last char only."""
+    if not value or not value.strip():
+        return "<empty>"
+    v = value.strip()
+    if len(v) <= 4:
+        return "*" * len(v)
+    return f"{v[0]}***{v[-1]}"
+
+
+# Debug: print whether Binance env vars are loaded (masked)
+_env_api_key = os.getenv("BINANCE_API_KEY", "").strip()
+_env_api_secret = (os.getenv("BINANCE_SECRET_KEY") or os.getenv("BINANCE_API_SECRET") or "").strip()
+_env_testnet = os.getenv("BINANCE_TESTNET", "True").strip().lower() == "true"
+print(
+    "[Binance env] BINANCE_API_KEY=%s | BINANCE_SECRET_KEY/API_SECRET=%s | "
+    "BINANCE_TESTNET=%s -> testnet_mode=%s"
+    % (_mask_key(_env_api_key), _mask_key(_env_api_secret), os.getenv("BINANCE_TESTNET", ""), _env_testnet)
+)
+
 # Optional: debug Telegram env (mask token)
 _tok = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 _chat = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -86,10 +108,17 @@ class TradingBot:
         self.logger.info(f"Trading bot starting. Log file: {log_file}")
         
         # Load configuration from environment
-        api_key = os.getenv('BINANCE_API_KEY')
-        api_secret = os.getenv('BINANCE_API_SECRET')
-        testnet = os.getenv('BINANCE_TESTNET', 'True').lower() == 'true'
-        
+        # Support both BINANCE_SECRET_KEY (e.g. .env) and BINANCE_API_SECRET (docs)
+        api_key = (os.getenv('BINANCE_API_KEY') or "").strip()
+        api_secret = (
+            (os.getenv('BINANCE_SECRET_KEY') or os.getenv('BINANCE_API_SECRET')) or ""
+        ).strip()
+        testnet = os.getenv('BINANCE_TESTNET', 'True').strip().lower() == 'true'
+
+        if not testnet:
+            self.logger.error("Live trading attempt detected. Testnet mode is required.")
+            raise RuntimeError("Live trading is disabled. This bot may only run in Testnet mode.")
+
         trading_pair = os.getenv('TRADING_PAIR', 'ETHUSDT')
         timeframe = os.getenv('TIMEFRAME', '4h')
         paper_trading = os.getenv('PAPER_TRADING', 'False').lower() == 'true'
