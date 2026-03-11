@@ -15,3 +15,80 @@ Use a .env file for securely storing API keys and avoid exposing them in the cod
 Implement error handling for common issues like API errors, high volatility, and connection issues
 
 Paper trade for at least 100 simulated trades before live trading
+
+Trading Bot Development Workflow
+
+Development workflow must always follow:
+
+Cursor → GitHub → VPS
+
+The VPS runs the production bot and must never be modified directly.
+
+All code changes must follow this process:
+
+Modify code locally in Cursor
+
+Ensure changes do not alter strategy logic unless explicitly requested
+
+Commit changes to Git
+
+Push to GitHub
+
+Deploy to VPS using:
+
+git pull
+sudo systemctl restart tradingbot
+
+Direct editing of code on the VPS is prohibited except for emergency debugging.
+
+Production Safety Rules
+
+The following modules control live trading behavior and must not be modified unless explicitly requested:
+
+strategy.py
+risk.py
+execution.py
+
+Safe modules to modify:
+
+notifications.py
+journal.py
+equity.py
+scanner.py
+main.py (only orchestration logic)
+Risk Management Constraints
+
+The assistant must preserve the following system constraints:
+
+Risk per trade = 1%
+Daily loss limit = 3%
+Max portfolio exposure = 50%
+
+These values must never be removed or overridden.
+
+Logging Requirements
+
+All new features must log useful data.
+
+Logs must be written to:
+
+logs/
+
+Required files:
+
+trading_bot_YYYYMMDD.log
+equity_curve.csv
+Monitoring Rules
+
+Telegram notifications must exist for:
+
+bot start
+trade entry
+trade exit
+errors
+4-hour status reports
+
+Status messages must not be sent more frequently than every 4 hours.
+
+When proposing major architecture changes (e.g. scanners, exchanges, new risk logic),
+the assistant must first describe the plan before modifying the code.

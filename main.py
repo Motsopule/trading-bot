@@ -9,7 +9,7 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, List
 from dotenv import load_dotenv
 
@@ -19,6 +19,10 @@ from risk import RiskManager
 from execution import OrderExecutor
 from journal import write_trade_entry
 from notifications import TelegramNotifier
+from equity import log_equity
+
+# Telegram status message throttle: send at most every 4 hours
+STATUS_INTERVAL = timedelta(hours=4)
 
 # Load environment variables from project directory (reliable regardless of cwd)
 _env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -193,7 +197,7 @@ class TradingBot:
         self.price_history: List[float] = []  # global for kill-switch volatility
         self.consecutive_none_market_data = 0
         self.consecutive_none_price = 0
-        self.last_status_notify_time = 0.0
+        self.last_status_time = datetime.now(timezone.utc) - timedelta(hours=4)
 
         self.logger.info("Trading bot initialized successfully")
         self.logger.info(
@@ -604,11 +608,17 @@ class TradingBot:
                         total_exposure,
                     )
 
-                    now_ts = time.time()
-                    if now_ts - self.last_status_notify_time >= 3600:
+                    log_equity(
+                        risk_status['current_capital'],
+                        risk_status['daily_pnl'],
+                        len(self.positions),
+                        total_exposure,
+                    )
+
+                    if datetime.now(timezone.utc) - self.last_status_time > STATUS_INTERVAL:
                         try:
                             self.notifier.notify_status(risk_status)
-                            self.last_status_notify_time = now_ts
+                            self.last_status_time = datetime.now(timezone.utc)
                         except Exception as notify_err:
                             self.logger.warning(
                                 "state=NOTIFY_FAIL action=notify_status error=%s",

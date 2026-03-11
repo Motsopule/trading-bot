@@ -45,19 +45,25 @@ class DataFetcher:
                 api_secret=api_secret,
                 testnet=True
             )
+            # Force Spot Testnet URL (python-binance can default to live despite testnet=True)
+            self.client.API_URL = "https://testnet.binance.vision/api"
         else:
             self.client = Client(
                 api_key=api_key,
                 api_secret=api_secret
             )
-        
+
         self.symbol = None
         self.timeframe = None
         self.consecutive_errors = 0
         # Minimum position value (USDT) to count as a real position; avoids dust
         self.min_position_value_usdt = 10.0
 
-        logger.info(f"DataFetcher initialized (testnet={testnet})")
+        logger.info(
+            "DataFetcher initialized testnet=%s API_URL=%s",
+            testnet,
+            getattr(self.client, "API_URL", "unknown"),
+        )
 
     def set_trading_pair(self, symbol: str, timeframe: str):
         """

@@ -1,0 +1,2 @@
+# Top production markets (TRADING_PAIRS for multi-asset bot)
+SOLUSDT,ETHUSDT,BNBUSDT,BTCUSDT,AVAXUSDT
