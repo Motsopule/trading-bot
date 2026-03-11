@@ -539,7 +539,19 @@ class TradingBot:
         """Main bot loop."""
         self.running = True
         self.logger.info("Trading bot started")
-        
+
+        # Optional: run market scanner once at startup (collects signals only; no trading)
+        if os.getenv("ENABLE_MARKET_SCANNER", "").strip().lower() == "true":
+            try:
+                from scanner import scan_markets
+                candidates = scan_markets(self.strategy, self.data_fetcher)
+                self.logger.info(
+                    "scanner completed: %d signal candidate(s) (trading unchanged)",
+                    len(candidates),
+                )
+            except Exception as e:
+                self.logger.warning("scanner run failed (trading unchanged): %s", e)
+
         try:
             while self.running:
                 try:

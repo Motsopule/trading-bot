@@ -77,6 +77,30 @@ class DataFetcher:
         self.timeframe = timeframe
         logger.info(f"Trading pair set: {symbol} on {timeframe}")
 
+    def get_candles(
+        self,
+        symbol: str,
+        timeframe: Optional[str] = None,
+        limit: int = 500,
+    ) -> Optional[pd.DataFrame]:
+        """
+        Exchange-agnostic: fetch candle data for a symbol.
+
+        Sets the internal symbol/timeframe and returns OHLCV candles.
+        Allows the same interface for Binance, Forex, Deriv, or other backends.
+
+        Args:
+            symbol: Trading pair symbol (e.g. 'ETHUSDT')
+            timeframe: Optional interval (e.g. '4h'); uses instance default if None
+            limit: Number of candles (default 500)
+
+        Returns:
+            DataFrame with OHLCV data, or None if fetch fails
+        """
+        tf = timeframe or self.timeframe or "4h"
+        self.set_trading_pair(symbol, tf)
+        return self.get_klines(limit=limit)
+
     def _require_symbol_timeframe(self) -> bool:
         """Return True if symbol and timeframe are set; log and return False otherwise."""
         if not self.symbol or not self.timeframe:
