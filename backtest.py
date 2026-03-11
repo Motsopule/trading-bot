@@ -51,7 +51,7 @@ class BacktestConfig:
     daily_loss_limit_percent: float = 3.0
     risk_per_trade_percent: float = 1.0
     max_position_exposure_percent: float = 50.0
-    lookback_years: int = 2
+    lookback_years: int = 8  # Max available on Binance 4h (~8 years for BTC/ETH)
     trade_log_csv: str = "backtest_trades.csv"
     trading_fee_percent: float = 0.1  # 0.1% per side
     slippage_percent: float = 0.05   # 0.05%
@@ -303,6 +303,7 @@ def run_backtest(config: Optional[BacktestConfig] = None) -> Tuple[pd.DataFrame,
             daily_loss_limit_percent=float(
                 os.getenv("DAILY_LOSS_LIMIT_PERCENT", "3.0")
             ),
+            lookback_years=int(os.getenv("BACKTEST_LOOKBACK_YEARS", "8")),
             trading_fee_percent=float(os.getenv("TRADING_FEE_PERCENT", "0.1")),
             slippage_percent=float(os.getenv("SLIPPAGE_PERCENT", "0.05")),
         )

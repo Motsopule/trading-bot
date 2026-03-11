@@ -10,20 +10,28 @@ from __future__ import annotations
 
 import math
 import os
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import pandas as pd
 from dotenv import load_dotenv
 
 from backtest import BacktestConfig, run_backtest
 
+# Criteria for selecting production markets (Task 3)
+MIN_TRADES_FOR_PRODUCTION = 10
+MAX_ACCEPTABLE_DRAWDOWN_PERCENT = -40.0  # e.g. -40% max drawdown acceptable
+TOP_N_PRODUCTION_MARKETS = 5
 
+
+# Multi-asset backtest: same strategy, independent run per asset
 PAIRS: List[str] = [
-    "BTCUSDT",
     "ETHUSDT",
-    "SOLUSDT",
     "BNBUSDT",
+    "SOLUSDT",
+    "BTCUSDT",
+    "LINKUSDT",
     "AVAXUSDT",
+    "ADAUSDT",
 ]
 
 
@@ -49,6 +57,7 @@ def _load_base_config_from_env() -> BacktestConfig:
         daily_loss_limit_percent=float(
             os.getenv("DAILY_LOSS_LIMIT_PERCENT", "3.0")
         ),
+        lookback_years=int(os.getenv("BACKTEST_LOOKBACK_YEARS", "8")),
         trading_fee_percent=float(os.getenv("TRADING_FEE_PERCENT", "0.1")),
         slippage_percent=float(os.getenv("SLIPPAGE_PERCENT", "0.05")),
     )
@@ -106,6 +115,70 @@ def _save_results_csv(results: List[Dict[str, float]], csv_path: str) -> None:
     """
     df = pd.DataFrame(results)
     df.to_csv(csv_path, index=False)
+
+
+def select_production_markets(
+    results: List[Dict[str, float]],
+    min_trades: int = MIN_TRADES_FOR_PRODUCTION,
+    max_drawdown_percent: float = MAX_ACCEPTABLE_DRAWDOWN_PERCENT,
+    top_n: int = TOP_N_PRODUCTION_MARKETS,
+) -> Tuple[List[str], List[Dict[str, float]]]:
+    """
+    From backtest results, select top 3-5 assets for production:
+    - highest profit factor
+    - acceptable drawdown (e.g. max drawdown >= max_drawdown_percent)
+    - sufficient trade frequency (min_trades)
+
+    Returns:
+        (list of selected pair symbols, list of their result dicts).
+    """
+    # Filter: sufficient trades and acceptable drawdown
+    filtered = [
+        r
+        for r in results
+        if r["total_trades"] >= min_trades
+        and r["max_drawdown"] >= max_drawdown_percent
+    ]
+    # Sort by profit factor descending (inf last or first — put inf first)
+    def _pf_sort_key(r: Dict[str, float]) -> Tuple[int, float]:
+        pf = r["profit_factor"]
+        return (0 if math.isinf(pf) else 1, -pf if not math.isinf(pf) else 0)
+
+    filtered.sort(key=_pf_sort_key)
+    # Take top N
+    selected = filtered[:top_n]
+    symbols = [r["pair"] for r in selected]
+    return symbols, selected
+
+
+def _print_and_save_production_markets(
+    results: List[Dict[str, float]],
+    output_path: str = "production_markets.txt",
+) -> None:
+    """Identify top 3-5 production markets and print/save them."""
+    symbols, selected = select_production_markets(results)
+    if not selected:
+        print(
+            "\nNo assets met production criteria "
+            f"(min_trades>={MIN_TRADES_FOR_PRODUCTION}, "
+            f"max_drawdown>={MAX_ACCEPTABLE_DRAWDOWN_PERCENT}%)."
+        )
+        return
+    print("\n--- Best strategy markets (production candidates) ---")
+    print(
+        f"Criteria: profit factor (high), drawdown>={MAX_ACCEPTABLE_DRAWDOWN_PERCENT}%, "
+        f"min_trades>={MIN_TRADES_FOR_PRODUCTION}"
+    )
+    for r in selected:
+        pf_str = "Inf" if math.isinf(r["profit_factor"]) else f"{r['profit_factor']:.2f}"
+        print(
+            f"  {r['pair']}: PF={pf_str}, trades={int(r['total_trades'])}, "
+            f"drawdown={r['max_drawdown']:.1f}%, return={r['total_return']:.1f}%"
+        )
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("# Top production markets (TRADING_PAIRS for multi-asset bot)\n")
+        f.write(",".join(symbols) + "\n")
+    print(f"\nProduction markets list saved to '{output_path}' (use as TRADING_PAIRS).")
 
 
 def run_multi_backtest() -> List[Dict[str, float]]:
@@ -168,6 +241,8 @@ def run_multi_backtest() -> List[Dict[str, float]]:
     csv_path = "multi_asset_results.csv"
     _save_results_csv(results, csv_path)
     print(f"\nSummary results saved to '{csv_path}'.")
+
+    _print_and_save_production_markets(results)
 
     return results
 

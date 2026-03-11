@@ -8,7 +8,10 @@ A Python-based cryptocurrency trading bot for Binance that trades ETH/USDT using
 - **Risk Management**: 
   - Stop-loss at 2x ATR (Average True Range)
   - Daily loss limit (3% of capital)
+  - Max portfolio exposure (50%)
+  - Risk per trade (1% of capital)
   - Trading hours restriction (London/NY overlap: 8 AM - 5 PM UTC)
+- **Multi-asset**: Trade multiple pairs with shared capital and per-trade/exposure limits
 - **Kill Switch**: Automatic shutdown on consecutive API errors or large price moves
 - **Comprehensive Logging**: All trades, errors, and events logged to files
 - **Paper Trading**: Start with Binance testnet before live trading
@@ -17,14 +20,18 @@ A Python-based cryptocurrency trading bot for Binance that trades ETH/USDT using
 
 ```
 Trading Bot/
-├── data.py          # Market data fetching from Binance API
-├── strategy.py      # Trading strategy logic (MA crossover, ATR)
-├── risk.py          # Risk management (loss limits, trading hours, kill switch)
-├── execution.py     # Order placement and management
-├── main.py          # Main bot orchestration
-├── requirements.txt # Python dependencies
-├── .env             # Environment variables (create from .env.example)
-└── README.md        # This file
+├── data.py            # Market data fetching from Binance API
+├── strategy.py        # Trading strategy logic (MA crossover, ATR)
+├── risk.py            # Risk management (loss limits, exposure, kill switch)
+├── execution.py       # Order placement and management
+├── main.py            # Main bot orchestration
+├── backtest.py        # Backtesting engine (fees, slippage, long/short)
+├── multi_backtest.py  # Multi-asset backtest and production market selection
+├── journal.py         # Trade journal (CSV)
+├── notifications.py  # Telegram notifications
+├── requirements.txt   # Python dependencies
+├── .env               # Environment variables (not committed)
+└── README.md          # This file
 ```
 
 ## Setup
@@ -79,6 +86,10 @@ MAX_PRICE_MOVE_PERCENT=10.0
 ## Usage
 
 ### Running the Bot
+
+**Single pair** (default): set `TRADING_PAIR=ETHUSDT` in `.env`.
+
+**Multiple pairs**: set `TRADING_PAIRS=ETHUSDT,BTCUSDT,SOLUSDT` (comma-separated). Same strategy and shared capital; 1% risk per trade, 3% daily loss limit, 50% max portfolio exposure.
 
 ```bash
 python main.py
@@ -177,6 +188,26 @@ Logs include:
 - Verify market conditions
 - Manually reset if needed (modify `risk_state.json`)
 
+## Backtesting
+
+Backtests use Binance historical 4H data with fees and slippage, long and short trades, and ATR stop-loss.
+
+**Single-asset backtest** (default 8 years of data):
+
+```bash
+python backtest.py
+```
+
+Optional `.env`: `BACKTEST_LOOKBACK_YEARS=8`, `TRADING_FEE_PERCENT=0.1`, `SLIPPAGE_PERCENT=0.05`.
+
+**Multi-asset backtest** (ETHUSDT, BNBUSDT, SOLUSDT, BTCUSDT, LINKUSDT, AVAXUSDT, ADAUSDT):
+
+```bash
+python multi_backtest.py
+```
+
+Outputs a comparison table, saves `multi_asset_results.csv`, and writes **production market candidates** (top 3–5 by profit factor, acceptable drawdown, min trades) to `production_markets.txt`. Use that list as `TRADING_PAIRS` for live/paper multi-asset trading.
+
 ## Configuration Options
 
 All configuration is done via environment variables in `.env`:
@@ -184,9 +215,10 @@ All configuration is done via environment variables in `.env`:
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `BINANCE_API_KEY` | Binance API key | Required |
-| `BINANCE_API_SECRET` | Binance API secret | Required |
+| `BINANCE_SECRET_KEY` or `BINANCE_API_SECRET` | Binance API secret | Required |
 | `BINANCE_TESTNET` | Use testnet | True |
-| `TRADING_PAIR` | Trading pair | ETHUSDT |
+| `TRADING_PAIR` | Single trading pair | ETHUSDT |
+| `TRADING_PAIRS` | Multi-asset (comma-separated) | — |
 | `TIMEFRAME` | Kline interval | 4h |
 | `INITIAL_CAPITAL` | Starting capital | 1000.0 |
 | `DAILY_LOSS_LIMIT_PERCENT` | Daily loss limit % | 3.0 |
@@ -195,6 +227,22 @@ All configuration is done via environment variables in `.env`:
 | `TRADING_END_HOUR` | Trading end hour (UTC) | 17 |
 | `MAX_CONSECUTIVE_API_ERRORS` | Max errors before kill switch | 5 |
 | `MAX_PRICE_MOVE_PERCENT` | Max price move % before kill switch | 10.0 |
+| `BACKTEST_LOOKBACK_YEARS` | Backtest history length (years) | 8 |
+
+## Deploy on VPS
+
+1. Clone the repository (no build step; Python only):
+   ```bash
+   git clone <your-repo-url> trading-bot && cd trading-bot
+   ```
+2. Create a virtual environment and install dependencies:
+   ```bash
+   python -m venv venv
+   source venv/bin/activate   # or `venv\\Scripts\\activate` on Windows
+   pip install -r requirements.txt
+   ```
+3. Copy `.env.example` to `.env` (or create `.env`) and set API keys, `TRADING_PAIR` or `TRADING_PAIRS`, and other variables.
+4. Run: `python main.py` (or run backtests first: `python backtest.py`, `python multi_backtest.py`).
 
 ## License
 

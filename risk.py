@@ -147,6 +147,35 @@ class RiskManager:
         
         return True, None
 
+    def can_add_position(
+        self,
+        current_total_exposure: float,
+        new_position_value: float,
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Check if adding a new position would exceed max portfolio exposure (50%).
+        Used for multi-asset trading: total exposure across all open positions
+        must not exceed max_position_exposure_percent of capital.
+
+        Args:
+            current_total_exposure: Sum of (position value) for all open positions.
+            new_position_value: Notional value of the new position to open.
+
+        Returns:
+            (True, None) if allowed; (False, reason) if would exceed limit.
+        """
+        max_exposure = self.current_capital * (
+            self.max_position_exposure_percent / 100.0
+        )
+        total_after = current_total_exposure + new_position_value
+        if total_after > max_exposure:
+            return (
+                False,
+                f"Max portfolio exposure would be exceeded: "
+                f"{total_after:.2f} > {max_exposure:.2f} ({self.max_position_exposure_percent}% of capital)",
+            )
+        return True, None
+
     def record_trade(self, trade_result: Dict):
         """
         Record a completed trade and update daily P&L.

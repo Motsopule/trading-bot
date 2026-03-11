@@ -10,7 +10,7 @@ import os
 import sys
 import time
 from datetime import datetime, timezone
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 from dotenv import load_dotenv
 
 from data import DataFetcher
@@ -119,7 +119,18 @@ class TradingBot:
             self.logger.error("Live trading attempt detected. Testnet mode is required.")
             raise RuntimeError("Live trading is disabled. This bot may only run in Testnet mode.")
 
-        trading_pair = os.getenv('TRADING_PAIR', 'ETHUSDT')
+        # Multi-asset: TRADING_PAIRS comma-separated, or single TRADING_PAIR
+        _pairs_env = (os.getenv('TRADING_PAIRS') or '').strip()
+        if _pairs_env:
+            self.trading_pairs: List[str] = [
+                s.strip() for s in _pairs_env.split(',') if s.strip()
+            ]
+        else:
+            self.trading_pairs = [os.getenv('TRADING_PAIR', 'ETHUSDT').strip()]
+        if not self.trading_pairs:
+            self.logger.error("No trading pairs configured (TRADING_PAIRS or TRADING_PAIR)")
+            sys.exit(1)
+        trading_pair = self.trading_pairs[0]  # default for initial data_fetcher
         timeframe = os.getenv('TIMEFRAME', '4h')
         paper_trading = os.getenv('PAPER_TRADING', 'False').lower() == 'true'
         initial_capital = float(os.getenv('INITIAL_CAPITAL', '1000.0'))
@@ -161,35 +172,44 @@ class TradingBot:
             max_consecutive_price_failures=max_consecutive_price_failures
         )
         
-        self.executor = OrderExecutor(
-            self.data_fetcher.client,
-            trading_pair,
-            paper_trading=paper_trading
-        )
+        # One executor per symbol for multi-asset
+        self.executors: Dict[str, OrderExecutor] = {
+            sym: OrderExecutor(
+                self.data_fetcher.client,
+                sym,
+                paper_trading=paper_trading,
+            )
+            for sym in self.trading_pairs
+        }
         self.paper_trading = paper_trading
 
         self.notifier = TelegramNotifier()
 
-        # Bot state
+        # Bot state (multi-asset: positions and market_data keyed by symbol)
         self.running = False
-        self.current_position = None
-        self.last_price = None
-        self.price_history = []
+        self.positions: Dict[str, Dict] = {}  # symbol -> position dict
+        self.market_data: Dict[str, object] = {}  # symbol -> DataFrame
+        self.last_price: Dict[str, float] = {}  # symbol -> last price
+        self.price_history: List[float] = []  # global for kill-switch volatility
         self.consecutive_none_market_data = 0
         self.consecutive_none_price = 0
         self.last_status_notify_time = 0.0
 
         self.logger.info("Trading bot initialized successfully")
-        self.logger.info(f"Trading pair: {trading_pair}, Timeframe: {timeframe}")
+        self.logger.info(
+            "Trading pairs: %s, Timeframe: %s",
+            self.trading_pairs,
+            timeframe,
+        )
         self.logger.info(f"Testnet mode: {testnet}")
         self.logger.info(
             "Execution mode: %s",
             "PAPER (simulated)" if paper_trading else "LIVE (real orders)"
         )
 
-    def update_market_data(self) -> bool:
+    def update_market_data(self, symbol: str) -> bool:
         """
-        Fetch and update market data.
+        Fetch and update market data for one symbol.
 
         Validates candle count against required MA period; skips indicator
         calculation if insufficient data.
@@ -198,20 +218,18 @@ class TradingBot:
             True if successful, False otherwise
         """
         try:
-            symbol = self.data_fetcher.symbol
+            self.data_fetcher.set_trading_pair(symbol, self.data_fetcher.timeframe or '4h')
             timeframe = self.data_fetcher.timeframe
             required_ma_period = self.strategy.ma_200_period
 
             df = self.data_fetcher.get_klines(limit=500)
             if df is None:
-                self.consecutive_none_market_data += 1
                 self.logger.warning(
                     "symbol=%s timeframe=%s state=HALT reason=market_data_none "
                     "consecutive_none_klines=%d",
                     symbol, timeframe, self.consecutive_none_market_data
                 )
                 return False
-            self.consecutive_none_market_data = 0
 
             num_candles = len(df)
             if num_candles < required_ma_period:
@@ -240,23 +258,19 @@ class TradingBot:
             # Get current price
             current_price = self.data_fetcher.get_current_price()
             if current_price is None:
-                self.consecutive_none_price += 1
                 self.logger.warning(
-                    "symbol=%s timeframe=%s state=HALT reason=price_fetch_failed "
-                    "consecutive_none_price=%d",
-                    symbol, timeframe, self.consecutive_none_price
+                    "symbol=%s timeframe=%s state=HALT reason=price_fetch_failed",
+                    symbol, timeframe
                 )
                 return False
-            self.consecutive_none_price = 0
             
-            # Track price history for volatility check
-            if self.last_price is not None:
-                price_change = ((current_price - self.last_price) / self.last_price) * 100
+            # Track price history for volatility check (global)
+            prev = self.last_price.get(symbol)
+            if prev is not None:
+                price_change = ((current_price - prev) / prev) * 100
                 self.price_history.append(price_change)
                 if len(self.price_history) > 10:
                     self.price_history.pop(0)
-                
-                # Check for large price moves
                 if abs(price_change) >= self.risk_manager.max_price_move_percent:
                     self.risk_manager.check_kill_switch(
                         self.data_fetcher.consecutive_errors,
@@ -264,20 +278,33 @@ class TradingBot:
                         consecutive_none_market_data=self.consecutive_none_market_data,
                         consecutive_price_failures=self.consecutive_none_price
                     )
-            
-            self.last_price = current_price
-            self.market_data = df
+            self.last_price[symbol] = current_price
+            self.market_data[symbol] = df
             
             return True
             
         except Exception as e:
-            self.logger.error(f"Error updating market data: {e}")
+            self.logger.error(f"Error updating market data for {symbol}: {e}")
             return False
 
-    def check_and_enter_position(self):
-        """Check for entry signals and enter position if conditions are met."""
-        if self.current_position is not None:
-            return  # Already in a position
+    def _total_exposure_usdt(self) -> float:
+        """Sum of (position value) across all open positions using latest market data."""
+        total = 0.0
+        for sym, pos in self.positions.items():
+            df = self.market_data.get(sym)
+            if df is not None and len(df) > 0 and pos.get('quantity'):
+                price = float(df.iloc[-1]['close'])
+                total += pos['quantity'] * price
+        return total
+
+    def check_and_enter_position(self, symbol: str, total_exposure: float):
+        """Check for entry signals and enter position if conditions are met for symbol."""
+        if self.positions.get(symbol) is not None:
+            return  # Already in a position for this symbol
+        
+        df = self.market_data.get(symbol)
+        if df is None:
+            return
         
         # Check if we can open a new trade
         can_trade, reason = self.risk_manager.can_open_new_trade()
@@ -293,21 +320,18 @@ class TradingBot:
         )
         if kill_switch:
             self.logger.warning(
-                "symbol=%s timeframe=%s state=HALT kill_switch_check_failed: %s",
-                self.data_fetcher.symbol, self.data_fetcher.timeframe, kill_reason
+                "symbol=%s state=HALT kill_switch_check_failed: %s",
+                symbol, kill_reason
             )
             return
         
-        # Check entry signal
-        entry_signal, signal_details = self.strategy.check_entry_signal(
-            self.market_data
-        )
+        # Check entry signal (long only; strategy unchanged)
+        entry_signal, signal_details = self.strategy.check_entry_signal(df)
         
         if not entry_signal:
             return
         
         try:
-            # Calculate position size
             stop_loss = self.strategy.calculate_stop_loss(
                 signal_details['entry_price'],
                 signal_details['atr']
@@ -323,38 +347,45 @@ class TradingBot:
                 self.logger.warning("Invalid position size calculated")
                 return
             
-            # Get account balance (paper: use risk manager capital; live: exchange balance)
+            required_usdt = position_size * signal_details['entry_price']
+            can_add, exposure_reason = self.risk_manager.can_add_position(
+                total_exposure, required_usdt
+            )
+            if not can_add:
+                self.logger.debug(
+                    "symbol=%s skip_entry: %s", symbol, exposure_reason
+                )
+                return
+            
             if self.paper_trading:
                 usdt_balance = self.risk_manager.get_risk_status()['current_capital']
             else:
+                self.data_fetcher.set_trading_pair(symbol, self.data_fetcher.timeframe or '4h')
                 balances = self.data_fetcher.get_account_balance()
                 if balances is None:
                     return
                 usdt_balance = balances.get('USDT', 0.0)
-            required_usdt = position_size * signal_details['entry_price']
             
             if required_usdt > usdt_balance:
                 self.logger.warning(
-                    f"Insufficient balance: need {required_usdt:.2f}, "
-                    f"have {usdt_balance:.2f}"
+                    "symbol=%s insufficient balance: need %.2f, have %.2f",
+                    symbol, required_usdt, usdt_balance
                 )
                 return
             
-            # Place buy order
-            buy_order = self.executor.place_market_buy_order(position_size)
+            executor = self.executors[symbol]
+            buy_order = executor.place_market_buy_order(position_size)
             if buy_order is None:
-                self.logger.error("Failed to place buy order")
+                self.logger.error("symbol=%s failed to place buy order", symbol)
                 return
 
-            # Use filled execution price and executed quantity from order (not ticker)
             entry_price = buy_order.get('price') or signal_details['entry_price']
             executed_qty = buy_order.get('quantity', 0) or 0
             if executed_qty <= 0:
-                self.logger.error("Buy order returned no executed quantity")
+                self.logger.error("symbol=%s buy order returned no executed quantity", symbol)
                 return
 
-            # Record position with fill price and executed size
-            self.current_position = {
+            self.positions[symbol] = {
                 'entry_price': entry_price,
                 'entry_time': datetime.now(timezone.utc),
                 'quantity': executed_qty,
@@ -363,26 +394,21 @@ class TradingBot:
                 'buy_order': buy_order
             }
             
-            # Place stop-loss order (use executed quantity for monitoring)
-            stop_order = self.executor.place_stop_loss_order(
-                executed_qty,
-                stop_loss
-            )
-            
+            stop_order = executor.place_stop_loss_order(executed_qty, stop_loss)
             if stop_order:
-                self.current_position['stop_order'] = stop_order
+                self.positions[symbol]['stop_order'] = stop_order
             
+            timeframe = self.data_fetcher.timeframe or '4h'
             entry_state = "PAPER_ENTRY" if self.paper_trading else "LIVE_ENTRY"
             self.logger.info(
                 "symbol=%s timeframe=%s state=%s executed_qty=%.6f "
                 "entry_price=%.2f stop_loss=%.2f",
-                self.data_fetcher.symbol, self.data_fetcher.timeframe,
-                entry_state, executed_qty, entry_price, stop_loss
+                symbol, timeframe, entry_state, executed_qty, entry_price, stop_loss
             )
 
             try:
                 self.notifier.notify_entry(
-                    {**self.current_position, 'symbol': self.data_fetcher.symbol}
+                    {**self.positions[symbol], 'symbol': symbol}
                 )
             except Exception as notify_err:
                 self.logger.warning(
@@ -392,59 +418,54 @@ class TradingBot:
         except Exception as e:
             entry_state = "PAPER_ENTRY" if self.paper_trading else "LIVE_ENTRY"
             self.logger.error(
-                "symbol=%s timeframe=%s state=%s error: %s",
-                self.data_fetcher.symbol, self.data_fetcher.timeframe,
-                entry_state, e
+                "symbol=%s state=%s error: %s", symbol, entry_state, e
             )
 
-    def check_and_exit_position(self):
-        """Check for exit signals and exit position if conditions are met."""
-        if self.current_position is None:
-            return  # No position to exit
+    def check_and_exit_position(self, symbol: str):
+        """Check for exit signals and exit position if conditions are met for symbol."""
+        pos = self.positions.get(symbol)
+        if pos is None:
+            return
+        
+        df = self.market_data.get(symbol)
+        if df is None:
+            return
         
         try:
-            entry_price = self.current_position['entry_price']
+            entry_price = pos['entry_price']
+            exit_signal, exit_details = self.strategy.check_exit_signal(df, entry_price)
             
-            # Check exit signal
-            exit_signal, exit_details = self.strategy.check_exit_signal(
-                self.market_data,
-                entry_price
-            )
-            
-            # Check stop-loss
+            self.data_fetcher.set_trading_pair(symbol, self.data_fetcher.timeframe or '4h')
             current_price = self.data_fetcher.get_current_price()
+            if current_price is None and len(df) > 0:
+                current_price = float(df.iloc[-1]['close'])
             if current_price is None:
                 return
             
             stop_loss_hit = self.strategy.check_stop_loss(
-                current_price,
-                self.current_position['stop_loss']
+                current_price, pos['stop_loss']
             )
             
-            # Exit if signal or stop-loss hit
             if exit_signal or stop_loss_hit:
-                quantity = self.current_position['quantity']
-
-                # Place sell order
-                sell_order = self.executor.place_market_sell_order(quantity)
+                quantity = pos['quantity']
+                executor = self.executors[symbol]
+                sell_order = executor.place_market_sell_order(quantity)
                 if sell_order is None:
-                    self.logger.error("Failed to place sell order")
+                    self.logger.error("symbol=%s failed to place sell order", symbol)
                     return
 
-                # Use filled execution price and executed quantity from sell order
                 exit_price = sell_order.get('price') or current_price
                 executed_sell_qty = sell_order.get('quantity', 0) or quantity
                 pnl = (exit_price - entry_price) * executed_sell_qty
                 pnl_percent = ((exit_price - entry_price) / entry_price) * 100
                 
-                # Record trade (use executed quantities and fill prices)
                 trade_result = {
                     'entry_price': entry_price,
                     'exit_price': exit_price,
                     'quantity': executed_sell_qty,
                     'pnl': pnl,
                     'pnl_percent': pnl_percent,
-                    'entry_time': self.current_position['entry_time'].isoformat(),
+                    'entry_time': pos['entry_time'].isoformat(),
                     'exit_time': datetime.now(timezone.utc).isoformat(),
                     'exit_reason': 'stop_loss' if stop_loss_hit else 'signal',
                     'sell_order': sell_order
@@ -453,18 +474,17 @@ class TradingBot:
                 self.risk_manager.record_trade(trade_result)
 
                 execution_mode = "PAPER" if self.paper_trading else "LIVE"
+                timeframe = self.data_fetcher.timeframe or '4h'
                 write_trade_entry(
                     trade_result,
-                    self.data_fetcher.symbol,
-                    self.data_fetcher.timeframe,
+                    symbol,
+                    timeframe,
                     execution_mode,
                     logger=self.logger,
                 )
 
                 try:
-                    self.notifier.notify_exit(
-                        {**trade_result, 'symbol': self.data_fetcher.symbol}
-                    )
+                    self.notifier.notify_exit({**trade_result, 'symbol': symbol})
                 except Exception as notify_err:
                     self.logger.warning(
                         "state=NOTIFY_FAIL action=notify_exit error=%s", notify_err
@@ -472,46 +492,44 @@ class TradingBot:
 
                 exit_state = "PAPER_EXIT" if self.paper_trading else "LIVE_EXIT"
                 self.logger.info(
-                    "symbol=%s timeframe=%s state=%s exit_price=%.2f "
-                    "pnl=%.2f pnl_percent=%.2f exit_reason=%s",
-                    self.data_fetcher.symbol, self.data_fetcher.timeframe,
-                    exit_state, exit_price, pnl, pnl_percent,
+                    "symbol=%s state=%s exit_price=%.2f pnl=%.2f pnl_percent=%.2f exit_reason=%s",
+                    symbol, exit_state, exit_price, pnl, pnl_percent,
                     'stop_loss' if stop_loss_hit else 'signal'
                 )
 
-                # Clear position
-                self.current_position = None
+                del self.positions[symbol]
 
         except Exception as e:
             exit_state = "PAPER_EXIT" if self.paper_trading else "LIVE_EXIT"
-            self.logger.error(
-                "symbol=%s timeframe=%s state=%s error: %s",
-                self.data_fetcher.symbol, self.data_fetcher.timeframe,
-                exit_state, e
-            )
+            self.logger.error("symbol=%s state=%s error: %s", symbol, exit_state, e)
 
-    def monitor_position(self):
-        """Monitor current position and update status."""
-        if self.current_position is None:
+    def monitor_position(self, symbol: str):
+        """Monitor current position and update status for symbol."""
+        pos = self.positions.get(symbol)
+        if pos is None:
+            return
+        
+        df = self.market_data.get(symbol)
+        if df is None:
             return
         
         try:
             status = self.strategy.get_position_status(
-                self.market_data,
-                self.current_position['entry_price'],
-                self.current_position['stop_loss']
+                df,
+                pos['entry_price'],
+                pos['stop_loss']
             )
             
             if status.get('stop_loss_hit') or status.get('exit_signal'):
-                self.check_and_exit_position()
+                self.check_and_exit_position(symbol)
             else:
                 self.logger.debug(
-                    f"Position status: P&L={status.get('pnl_percent', 0):.2f}%, "
-                    f"Price={status.get('current_price', 0):.2f}"
+                    "symbol=%s position P&L=%.2f%% price=%.2f",
+                    symbol, status.get('pnl_percent', 0), status.get('current_price', 0)
                 )
                 
         except Exception as e:
-            self.logger.error(f"Error monitoring position: {e}")
+            self.logger.error("symbol=%s error monitoring position: %s", symbol, e)
 
     def run(self):
         """Main bot loop."""
@@ -521,22 +539,32 @@ class TradingBot:
         try:
             while self.running:
                 try:
-                    # Update market data
-                    if not self.update_market_data():
+                    # Update market data for all symbols
+                    any_update_ok = False
+                    for sym in self.trading_pairs:
+                        if self.update_market_data(sym):
+                            any_update_ok = True
+                    if any_update_ok:
+                        self.consecutive_none_market_data = 0
+                        self.consecutive_none_price = 0
+                    else:
+                        self.consecutive_none_market_data += 1
                         self.logger.warning(
-                            "symbol=%s timeframe=%s state=HALT "
-                            "reason=update_market_data_failed retrying_in=60s",
-                            self.data_fetcher.symbol, self.data_fetcher.timeframe
+                            "state=HALT reason=no_market_data_updated "
+                            "consecutive=%d retrying_in=60s",
+                            self.consecutive_none_market_data,
                         )
-                        time.sleep(60)  # Wait 1 minute before retry
+                        time.sleep(60)
                         continue
                     
-                    # Monitor existing position
-                    if self.current_position is not None:
-                        self.monitor_position()
-                    else:
-                        # Check for entry signals
-                        self.check_and_enter_position()
+                    total_exposure = self._total_exposure_usdt()
+                    
+                    for sym in self.trading_pairs:
+                        if self.positions.get(sym) is not None:
+                            self.monitor_position(sym)
+                        else:
+                            self.check_and_enter_position(sym, total_exposure)
+                            total_exposure = self._total_exposure_usdt()
                     
                     # Check kill switch
                     kill_switch, _ = self.risk_manager.check_kill_switch(
@@ -546,9 +574,7 @@ class TradingBot:
                     )
                     if self.risk_manager.kill_switch_active or kill_switch:
                         self.logger.critical(
-                            "symbol=%s timeframe=%s state=HALT "
-                            "kill_switch_active reason=%s",
-                            self.data_fetcher.symbol, self.data_fetcher.timeframe,
+                            "state=HALT kill_switch_active reason=%s",
                             self.risk_manager.kill_switch_reason
                         )
                         try:
@@ -560,31 +586,24 @@ class TradingBot:
                                 "state=NOTIFY_FAIL action=notify_kill_switch error=%s",
                                 notify_err,
                             )
-                        if self.current_position is not None:
-                            exit_state = (
-                                "PAPER_EXIT" if self.paper_trading else "LIVE_EXIT"
-                            )
+                        for sym in list(self.positions.keys()):
                             self.logger.info(
-                                "symbol=%s timeframe=%s state=%s "
-                                "reason=closing_position_due_to_kill_switch",
-                                self.data_fetcher.symbol, self.data_fetcher.timeframe,
-                                exit_state
+                                "symbol=%s closing_position_due_to_kill_switch", sym
                             )
-                            self.check_and_exit_position()
+                            self.check_and_exit_position(sym)
                         self.running = False
                         break
 
-                    # Log status periodically
                     risk_status = self.risk_manager.get_risk_status()
                     self.logger.info(
-                        "symbol=%s timeframe=%s state=MONITOR capital=%.2f "
-                        "daily_pnl=%.2f daily_trades=%d",
-                        self.data_fetcher.symbol, self.data_fetcher.timeframe,
+                        "state=MONITOR capital=%.2f daily_pnl=%.2f daily_trades=%d "
+                        "positions=%d exposure=%.2f",
                         risk_status['current_capital'], risk_status['daily_pnl'],
-                        risk_status['daily_trades_count']
+                        risk_status['daily_trades_count'],
+                        len(self.positions),
+                        total_exposure,
                     )
 
-                    # Optional: send status to Telegram at most once per hour
                     now_ts = time.time()
                     if now_ts - self.last_status_notify_time >= 3600:
                         try:
@@ -596,7 +615,6 @@ class TradingBot:
                                 notify_err,
                             )
 
-                    # Wait for next cycle (4-hour timeframe, check every 5 minutes)
                     time.sleep(300)  # 5 minutes
                     
                 except KeyboardInterrupt:
@@ -610,8 +628,8 @@ class TradingBot:
                     
         finally:
             self.logger.info("Trading bot stopped")
-            if self.current_position is not None:
-                self.logger.warning("Bot stopped with open position!")
+            if self.positions:
+                self.logger.warning("Bot stopped with open position(s): %s", list(self.positions.keys()))
 
 
 def main():
