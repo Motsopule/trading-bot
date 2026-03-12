@@ -35,6 +35,8 @@ SCAN_MARKETS = [
 
 SIGNAL_CANDIDATES_LOG = os.path.join("logs", "signal_candidates.csv")
 
+MIN_SCORE_THRESHOLD = 5
+
 
 def scan_markets(
     strategy: Any,
@@ -80,8 +82,10 @@ def scan_markets(
                 if df is None or len(df) < 2:
                     continue
 
-                # Check long entry
-                long_signal, long_details = strategy.check_entry_signal(df)
+                # Check long entry (with daily trend filter when data_fetcher provided)
+                long_signal, long_details = strategy.check_entry_signal(
+                    df, symbol=symbol, data_client=data_fetcher
+                )
                 if long_signal and long_details:
                     score = strategy.score_signal(df)
                     candidates.append({
@@ -105,6 +109,12 @@ def scan_markets(
             except Exception as e:
                 logger.debug("scanner symbol=%s error=%s", symbol, e)
                 continue
+
+        before_count = len(candidates)
+        candidates = [c for c in candidates if c["score"] >= MIN_SCORE_THRESHOLD]
+        removed = before_count - len(candidates)
+        if removed > 0:
+            logger.info("Signal score filter applied: %d candidates removed", removed)
 
         signals = sorted(candidates, key=lambda x: x["score"], reverse=True)
         signals = signals[:5]

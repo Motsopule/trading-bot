@@ -6,13 +6,27 @@ based on the specified strategy rules.
 """
 
 import logging
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, Any
 import pandas as pd
 import numpy as np
 from ta.volatility import AverageTrueRange
 from ta.trend import SMAIndicator
 
 logger = logging.getLogger(__name__)
+
+
+def daily_trend_bullish(symbol: str, data_client: Any) -> bool:
+    """
+    Higher timeframe confirmation: True when Daily MA50 > Daily MA200.
+    Used to allow only LONG trades when daily trend is bullish.
+    """
+    df_daily = data_client.get_candles(symbol, timeframe="1d", limit=200)
+    if df_daily is None or len(df_daily) < 200:
+        return False
+    df_daily = df_daily.copy()
+    df_daily["ma50"] = df_daily["close"].rolling(50).mean()
+    df_daily["ma200"] = df_daily["close"].rolling(200).mean()
+    return bool(df_daily["ma50"].iloc[-1] > df_daily["ma200"].iloc[-1])
 
 
 class TradingStrategy:
@@ -162,7 +176,9 @@ class TradingStrategy:
     def check_entry_signal(
         self,
         df: pd.DataFrame,
-        previous_df: Optional[pd.DataFrame] = None
+        previous_df: Optional[pd.DataFrame] = None,
+        symbol: Optional[str] = None,
+        data_client: Optional[Any] = None,
     ) -> Tuple[bool, Optional[Dict]]:
         """
         Check if entry signal conditions are met.
@@ -172,10 +188,13 @@ class TradingStrategy:
         2. Momentum: 20MA crosses above 50MA
            (previous 20MA <= previous 50MA and current 20MA > current 50MA)
         3. Volatility expansion: ATR(14) > ATR_MA(20) on current closed candle
+        4. Daily trend filter (when symbol/data_client provided): Daily MA50 > Daily MA200
 
         Args:
             df: Current DataFrame with indicators
             previous_df: Previous DataFrame for crossover detection
+            symbol: Optional symbol for daily trend check (long only)
+            data_client: Optional data client for fetching daily klines
             
         Returns:
             Tuple of (signal_present, signal_details)
@@ -231,6 +250,18 @@ class TradingStrategy:
             )
 
             if trend_filter_ok and volatility_filter_ok and ma_bullish_cross and rsi_momentum_ok and breakout:
+                # Daily trend filter for long: only allow when Daily MA50 > Daily MA200
+                if symbol and data_client:
+                    if not daily_trend_bullish(symbol, data_client):
+                        logger.debug(
+                            "Daily trend check: symbol=%s trend=bearish — signal rejected",
+                            symbol,
+                        )
+                        return False, None
+                    logger.debug(
+                        "Daily trend check: symbol=%s trend=bullish",
+                        symbol,
+                    )
                 signal_details = {
                     'entry_price': current['close'],
                     'ma_20': current['ma_20'],
