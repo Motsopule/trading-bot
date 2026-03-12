@@ -89,9 +89,16 @@ class TradingStrategy:
             # ATR(14) 20-period moving average for volatility expansion filter
             df['atr_ma'] = df['atr'].rolling(self.ATR_MA_PERIOD).mean()
 
+            # Calculate RSI(14) using only past (closed) candles
+            delta = df['close'].diff()
+            gain = delta.where(delta > 0, 0.0).rolling(14).mean()
+            loss = (-delta.where(delta < 0, 0.0)).rolling(14).mean()
+            rs = gain / loss.replace(0, np.nan)
+            df['rsi'] = 100 - (100 / (1 + rs))
+
             # Prevent NaN propagation: ensure last bar has valid indicators
             last = df.iloc[-1]
-            indicator_cols = ['ma_20', 'ma_50', 'ma_200', 'atr', 'atr_ma']
+            indicator_cols = ['ma_20', 'ma_50', 'ma_200', 'atr', 'atr_ma', 'rsi']
             for col in indicator_cols:
                 val = last.get(col)
                 if pd.isna(val) or (col == 'atr' and (val is None or val <= 0)) or (
@@ -110,6 +117,47 @@ class TradingStrategy:
         except Exception as e:
             logger.error("Error calculating indicators: %s", e)
             return df
+
+    def score_signal(self, df: pd.DataFrame) -> int:
+        """
+        Score a signal for ranking (higher = stronger).
+
+        Rules:
+        - Trend strength: MA50 > MA200 → +3
+        - Distance from MA50: (close - MA50)/MA50 > 0.02 → +2
+        - ATR expansion: ATR > rolling ATR mean(20) → +2
+        - Momentum: current close > previous close → +1
+
+        Returns:
+            Total score (0–8).
+        """
+        if df is None or len(df) < 2:
+            return 0
+        current = df.iloc[-1]
+        previous = df.iloc[-2]
+        score = 0
+        try:
+            ma_50 = current.get("ma_50")
+            ma_200 = current.get("ma_200")
+            if ma_50 is not None and ma_200 is not None and not pd.isna(ma_50) and not pd.isna(ma_200):
+                if ma_50 > ma_200:
+                    score += 3
+            close = current.get("close")
+            if close is not None and ma_50 is not None and not pd.isna(close) and not pd.isna(ma_50) and ma_50 > 0:
+                if (close - ma_50) / ma_50 > 0.02:
+                    score += 2
+            atr = current.get("atr")
+            atr_ma = current.get("atr_ma")
+            if atr is not None and atr_ma is not None and not pd.isna(atr) and not pd.isna(atr_ma):
+                if atr > atr_ma:
+                    score += 2
+            prev_close = previous.get("close")
+            if close is not None and prev_close is not None and not pd.isna(close) and not pd.isna(prev_close):
+                if close > prev_close:
+                    score += 1
+        except (TypeError, ZeroDivisionError):
+            pass
+        return score
 
     def check_entry_signal(
         self,
@@ -155,11 +203,18 @@ class TradingStrategy:
             if atr_ma is None or pd.isna(atr_ma) or not np.isfinite(atr_ma) or atr_ma <= 0:
                 return False, None
 
+            rsi_val = current.get('rsi')
+            if rsi_val is None or pd.isna(rsi_val) or not np.isfinite(rsi_val):
+                return False, None
+
             # Trend filter: 50MA above 200MA on current closed candle
             trend_filter_ok = current['ma_50'] > current['ma_200']
 
             # Volatility expansion: ATR(14) > ATR_MA(20) on current closed candle
             volatility_filter_ok = current['atr'] > current['atr_ma']
+
+            # Momentum filter: RSI(14) must be above 50 on current closed candle
+            rsi_momentum_ok = rsi_val > 50
 
             # Momentum: 20MA crosses above 50MA using previous vs current values
             ma_bullish_cross = (
@@ -167,13 +222,22 @@ class TradingStrategy:
                 and current['ma_20'] > current['ma_50']
             )
 
-            if trend_filter_ok and volatility_filter_ok and ma_bullish_cross:
+            # Breakout confirmation: close above recent 20-candle high (exclude current candle)
+            recent_high = df["high"].rolling(20).max().iloc[-2] if len(df) >= 21 else None
+            breakout = (
+                recent_high is not None
+                and not pd.isna(recent_high)
+                and current["close"] > recent_high
+            )
+
+            if trend_filter_ok and volatility_filter_ok and ma_bullish_cross and rsi_momentum_ok and breakout:
                 signal_details = {
                     'entry_price': current['close'],
                     'ma_20': current['ma_20'],
                     'ma_50': current['ma_50'],
                     'ma_200': current['ma_200'],
                     'atr': current['atr'],
+                    'rsi': rsi_val,
                     'side': 'long',
                     'timestamp': current.name
                 }

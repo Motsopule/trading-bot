@@ -36,27 +36,6 @@ SCAN_MARKETS = [
 SIGNAL_CANDIDATES_LOG = os.path.join("logs", "signal_candidates.csv")
 
 
-def _compute_strength_score(
-    close: float,
-    ma_50: float,
-    atr: float,
-    side: str,
-) -> Optional[float]:
-    """
-    Compute strength score for a signal.
-    long_score = (close - MA50) / ATR
-    short_score = (MA50 - close) / ATR
-    """
-    if atr is None or atr <= 0:
-        return None
-    try:
-        if side == "long":
-            return (close - ma_50) / atr
-        return (ma_50 - close) / atr
-    except (TypeError, ZeroDivisionError):
-        return None
-
-
 def scan_markets(
     strategy: Any,
     data_fetcher: Any,
@@ -72,10 +51,9 @@ def scan_markets(
     4. Check for entry signals (long and short)
     5. Compute a simple strength score per signal
 
-    Returns list of candidates sorted by score descending, e.g.:
+    Returns list of top 5 candidates by score_signal, e.g.:
     [
-        {"symbol": "SOLUSDT", "signal": "long", "score": 2.4},
-        {"symbol": "LINKUSDT", "signal": "short", "score": 1.8},
+        {"symbol": "SOLUSDT", "score": 8, "signal": "long", "signal_details": {...}},
     ]
 
     Restores data_fetcher symbol/timeframe after scanning so trading behaviour is unchanged.
@@ -102,38 +80,40 @@ def scan_markets(
                 if df is None or len(df) < 2:
                     continue
 
-                row = df.iloc[-1]
-                close = row.get("close")
-                ma_50 = row.get("ma_50")
-                atr = row.get("atr")
-                if close is None or ma_50 is None or atr is None:
-                    continue
-
                 # Check long entry
                 long_signal, long_details = strategy.check_entry_signal(df)
                 if long_signal and long_details:
-                    score = _compute_strength_score(
-                        float(close), float(ma_50), float(atr), "long"
-                    )
-                    if score is not None:
-                        candidates.append({"symbol": symbol, "signal": "long", "score": score})
+                    score = strategy.score_signal(df)
+                    candidates.append({
+                        "symbol": symbol,
+                        "score": score,
+                        "signal": "long",
+                        "signal_details": long_details,
+                    })
 
                 # Check short entry
                 short_signal, short_details = strategy.check_short_entry_signal(df)
                 if short_signal and short_details:
-                    score = _compute_strength_score(
-                        float(close), float(ma_50), float(atr), "short"
-                    )
-                    if score is not None:
-                        candidates.append({"symbol": symbol, "signal": "short", "score": score})
+                    score = strategy.score_signal(df)
+                    candidates.append({
+                        "symbol": symbol,
+                        "score": score,
+                        "signal": "short",
+                        "signal_details": short_details,
+                    })
 
             except Exception as e:
                 logger.debug("scanner symbol=%s error=%s", symbol, e)
                 continue
 
-        candidates.sort(key=lambda x: x["score"], reverse=True)
-        _log_candidates(candidates)
-        return candidates
+        signals = sorted(candidates, key=lambda x: x["score"], reverse=True)
+        signals = signals[:5]
+        if signals:
+            logger.info("Top signals ranked:")
+            for s in signals:
+                logger.info("symbol=%s score=%s", s["symbol"], s["score"])
+        _log_candidates(signals)
+        return signals
 
     finally:
         # Restore so main loop / trading is unaffected

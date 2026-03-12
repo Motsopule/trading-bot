@@ -24,6 +24,9 @@ from equity import log_equity
 # Telegram status message throttle: send at most every 4 hours
 STATUS_INTERVAL = timedelta(hours=4)
 
+# Market scanner interval: run every 4 hours when enabled
+SCAN_INTERVAL = timedelta(hours=4)
+
 # Load environment variables from project directory (reliable regardless of cwd)
 _env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 load_dotenv(dotenv_path=_env_path)
@@ -198,6 +201,12 @@ class TradingBot:
         self.consecutive_none_market_data = 0
         self.consecutive_none_price = 0
         self.last_status_time = datetime.now(timezone.utc) - timedelta(hours=4)
+
+        # Market scanner scheduling (non-intrusive to trading loop)
+        self.enable_market_scanner = (
+            os.getenv("ENABLE_MARKET_SCANNER", "").strip().lower() == "true"
+        )
+        self.last_scan_time = datetime.now(timezone.utc) - SCAN_INTERVAL
 
         self.logger.info("Trading bot initialized successfully")
         self.logger.info(
@@ -540,18 +549,6 @@ class TradingBot:
         self.running = True
         self.logger.info("Trading bot started")
 
-        # Optional: run market scanner once at startup (collects signals only; no trading)
-        if os.getenv("ENABLE_MARKET_SCANNER", "").strip().lower() == "true":
-            try:
-                from scanner import scan_markets
-                candidates = scan_markets(self.strategy, self.data_fetcher)
-                self.logger.info(
-                    "scanner completed: %d signal candidate(s) (trading unchanged)",
-                    len(candidates),
-                )
-            except Exception as e:
-                self.logger.warning("scanner run failed (trading unchanged): %s", e)
-
         try:
             while self.running:
                 try:
@@ -619,6 +616,21 @@ class TradingBot:
                         len(self.positions),
                         total_exposure,
                     )
+
+                    # Periodic market scanner (signals only; does not place trades)
+                    if self.enable_market_scanner:
+                        try:
+                            now = datetime.now(timezone.utc)
+                            if now - self.last_scan_time > SCAN_INTERVAL:
+                                from scanner import scan_markets
+                                candidates = scan_markets(self.strategy, self.data_fetcher)
+                                self.logger.info(
+                                    "scanner completed: %d signal candidate(s) (trading unchanged)",
+                                    len(candidates),
+                                )
+                                self.last_scan_time = now
+                        except Exception as e:
+                            self.logger.warning("scanner run failed (trading unchanged): %s", e)
 
                     log_equity(
                         risk_status['current_capital'],
