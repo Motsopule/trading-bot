@@ -92,3 +92,25 @@ Status messages must not be sent more frequently than every 4 hours.
 
 When proposing major architecture changes (e.g. scanners, exchanges, new risk logic),
 the assistant must first describe the plan before modifying the code.
+
+Research Strategy Development Rules
+
+New experimental strategies must be developed in a separate research environment.
+
+Do not modify the production trading bot when developing new strategies.
+
+Research code must be placed in:
+
+research/
+strategies/
+
+Production modules that must not be modified:
+
+strategy.py
+risk.py
+execution.py
+main.py
+
+Research strategies must be implemented as standalone backtesting scripts first.
+
+Only after a research strategy is validated may integration into the production engine be proposed.

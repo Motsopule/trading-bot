@@ -1,0 +1,19 @@
+MIN_TRADES = 20
+
+REGIME_WEIGHTS = {
+    "trend_strategy": {"TRENDING": 1.0, "RANGING": 0.3},
+    "mean_reversion_strategy": {"RANGING": 1.0, "TRENDING": 0.4},
+}
+
+LIFECYCLE_WEIGHTS = {
+    "WARMUP": 0.5,
+    "ACTIVE": 1.0,
+    "REDUCED": 0.5,
+    "DISABLED": 0.0,
+}
+
+VOLATILITY_HIGH_THRESHOLD = 1.5
+VOLATILITY_LOW_THRESHOLD = 0.7
+
+CORRELATION_THRESHOLD = 0.8
+CORRELATION_REDUCTION = 0.7

@@ -23,21 +23,27 @@ IMPORTANT:
 
 from __future__ import annotations
 
+import calendar
+import logging
 import math
 import os
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Dict, Tuple
 
 import numpy as np
 import pandas as pd
-import requests
 from dotenv import load_dotenv
 
+from research.data_providers.http_retry import http_get_with_retries
 from strategy import TradingStrategy
 
 
 BINANCE_BASE_URL = "https://api.binance.com"
+
+# Pause after each successful klines request to reduce API rate pressure.
+REQUEST_DELAY = 0.5
 
 
 @dataclass
@@ -55,6 +61,13 @@ class BacktestConfig:
     trade_log_csv: str = "backtest_trades.csv"
     trading_fee_percent: float = 0.1  # 0.1% per side
     slippage_percent: float = 0.05   # 0.05%
+
+
+def _utc_naive(dt: datetime) -> datetime:
+    """Convert aware UTC or naive datetime to UTC-naive for calendar.timegm."""
+    if dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
 
 
 def _interval_to_milliseconds(interval: str) -> int:
@@ -99,8 +112,17 @@ def fetch_historical_klines(
     Returns:
         DataFrame with OHLCV data indexed by UTC datetime.
     """
-    start_ms = int(start_time.replace(tzinfo=timezone.utc).timestamp() * 1000)
-    end_ms = int(end_time.replace(tzinfo=timezone.utc).timestamp() * 1000)
+    safe_end = datetime.utcnow() - timedelta(minutes=5)
+    start_date = _utc_naive(start_time)
+    end_naive = _utc_naive(end_time)
+    end_date = min(end_naive, safe_end)
+    if start_date >= end_date:
+        raise ValueError(
+            f"Invalid range after safe end cap: start={start_date} end={end_date}"
+        )
+    logging.info(f"[BINANCE SAFE RANGE] {symbol} → {start_date} to {end_date}")
+    start_ms = int(calendar.timegm(start_date.timetuple()) * 1000)
+    end_ms = int(calendar.timegm(end_date.timetuple()) * 1000)
     interval_ms = _interval_to_milliseconds(interval)
 
     all_klines: List[List] = []
@@ -114,13 +136,12 @@ def fetch_historical_klines(
             "endTime": end_ms,
             "limit": max_per_request,
         }
-        response = requests.get(
+        response = http_get_with_retries(
             f"{BINANCE_BASE_URL}/api/v3/klines",
             params=params,
-            timeout=10,
         )
-        response.raise_for_status()
         klines = response.json()
+        time.sleep(REQUEST_DELAY)
         if not klines:
             break
 
@@ -270,57 +291,91 @@ def compute_performance_metrics(
     max_drawdown = compute_max_drawdown(equity_curve)
     total_return = (final_equity / initial_capital - 1.0) * 100.0
 
+    # Annualized Sharpe from bar returns (4h bars: ~2190 per year)
+    sharpe_ratio = 0.0
+    if len(equity_curve) > 1 and equity_curve[0] > 0:
+        eq_series = pd.Series(equity_curve)
+        bar_returns = eq_series.pct_change().dropna()
+        if len(bar_returns) > 0 and bar_returns.std() > 0:
+            periods_per_year = 365 * 24 / 4  # 4h bars
+            sharpe_ratio = float(
+                bar_returns.mean() / bar_returns.std() * math.sqrt(periods_per_year)
+            )
+
     return {
         "total_trades": float(total_trades),
         "win_rate": win_rate,
         "profit_factor": profit_factor,
         "max_drawdown": max_drawdown,
         "total_return": total_return,
+        "sharpe_ratio": sharpe_ratio,
     }
 
 
-def run_backtest(config: Optional[BacktestConfig] = None) -> Tuple[pd.DataFrame, Dict]:
+def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Run the backtest and return trade log and performance metrics.
+    Normalize an OHLCV DataFrame to standard columns (open, high, low, close, volume)
+    and ensure a datetime index. Accepts yfinance-style (Open, High, etc.) or
+    already lowercased columns.
 
     Args:
-        config: Optional BacktestConfig; if None, values are loaded from the
-            environment (falling back to sensible defaults).
+        df: Raw OHLCV DataFrame, possibly with MultiIndex columns from yfinance.
 
     Returns:
-        Tuple of (trades_df, metrics_dict).
+        DataFrame with columns open, high, low, close, volume and datetime index.
     """
-    # Load environment so user can override defaults via .env
-    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-    load_dotenv(dotenv_path=env_path)
-
-    if config is None:
-        config = BacktestConfig(
-            symbol=os.getenv("TRADING_PAIR", "ETHUSDT"),
-            interval=os.getenv("TIMEFRAME", "4h"),
-            initial_capital=float(os.getenv("INITIAL_CAPITAL", "1000.0")),
-            atr_multiplier=float(os.getenv("STOP_LOSS_ATR_MULTIPLIER", "2.0")),
-            daily_loss_limit_percent=float(
-                os.getenv("DAILY_LOSS_LIMIT_PERCENT", "3.0")
-            ),
-            lookback_years=int(os.getenv("BACKTEST_LOOKBACK_YEARS", "8")),
-            trading_fee_percent=float(os.getenv("TRADING_FEE_PERCENT", "0.1")),
-            slippage_percent=float(os.getenv("SLIPPAGE_PERCENT", "0.05")),
+    if df is None or df.empty:
+        return df
+    # Flatten MultiIndex columns if present (yfinance sometimes returns them)
+    if isinstance(df.columns, pd.MultiIndex):
+        df = df.copy()
+        df.columns = df.columns.get_level_values(0)
+    col_map = {}
+    for c in df.columns:
+        c_lower = str(c).lower()
+        if c_lower in ("open", "high", "low", "close", "volume"):
+            col_map[c] = c_lower
+    df = df.rename(columns=col_map)
+    required = {"open", "high", "low", "close"}
+    if not required.issubset(df.columns):
+        raise ValueError(
+            f"DataFrame must have open, high, low, close; got {list(df.columns)}"
         )
+    if "volume" not in df.columns:
+        df["volume"] = 0.0
+    df = df[["open", "high", "low", "close", "volume"]].copy()
+    df = df.dropna(subset=["open", "high", "low", "close"])
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["open", "high", "low", "close"])
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index, utc=True)
+    return df
 
-    end_time = datetime.now(timezone.utc)
-    start_time = end_time - timedelta(days=365 * config.lookback_years)
 
-    print(
-        f"Fetching data for {config.symbol} {config.interval} from "
-        f"{start_time.date()} to {end_time.date()}..."
-    )
-    ohlcv = fetch_historical_klines(
-        symbol=config.symbol,
-        interval=config.interval,
-        start_time=start_time,
-        end_time=end_time,
-    )
+def run_backtest_with_ohlcv(
+    ohlcv: pd.DataFrame,
+    config: BacktestConfig,
+    verbose: bool = True,
+) -> Tuple[pd.DataFrame, Dict, pd.Series]:
+    """
+    Run the backtest engine on pre-fetched OHLCV data (e.g. from yfinance).
+
+    Strategy and risk logic are unchanged. Use this for non-Binance markets.
+
+    Args:
+        ohlcv: DataFrame with open, high, low, close, volume and datetime index.
+        config: BacktestConfig (symbol used for trade log and labels).
+        verbose: If True, print summary and save trade log CSV.
+
+    Returns:
+        Tuple of (trades_df, metrics_dict, equity_series with datetime index).
+    """
+    ohlcv = normalize_ohlcv(ohlcv.copy())
+    if len(ohlcv) < 200:
+        raise ValueError(
+            f"Insufficient bars for strategy (need 200+, got {len(ohlcv)})"
+        )
 
     strategy = TradingStrategy(atr_multiplier=config.atr_multiplier)
     df = strategy.calculate_indicators(ohlcv)
@@ -509,27 +564,77 @@ def run_backtest(config: Optional[BacktestConfig] = None) -> Tuple[pd.DataFrame,
     )
 
     trades_df = pd.DataFrame(trades)
-    if not trades_df.empty:
-        trades_df.to_csv(config.trade_log_csv, index=False)
+    equity_index = df_sorted.index[1:]
+    equity_series = pd.Series(equity_curve, index=equity_index)
 
-    # Print summary
-    print("Backtest results:")
-    print(f"  Total trades   : {int(metrics['total_trades'])}")
-    print(f"  Win rate       : {metrics['win_rate']:.2f}%")
-    if math.isinf(metrics["profit_factor"]):
-        pf_str = "Infinity"
-    else:
-        pf_str = f"{metrics['profit_factor']:.2f}"
-    print(f"  Profit factor  : {pf_str}")
-    print(f"  Max drawdown   : {metrics['max_drawdown']:.2f}%")
-    print(f"  Total return   : {metrics['total_return']:.2f}%")
+    if verbose:
+        if not trades_df.empty:
+            trades_df.to_csv(config.trade_log_csv, index=False)
+        print("Backtest results:")
+        print(f"  Total trades   : {int(metrics['total_trades'])}")
+        print(f"  Win rate       : {metrics['win_rate']:.2f}%")
+        if math.isinf(metrics["profit_factor"]):
+            pf_str = "Infinity"
+        else:
+            pf_str = f"{metrics['profit_factor']:.2f}"
+        print(f"  Profit factor  : {pf_str}")
+        print(f"  Max drawdown   : {metrics['max_drawdown']:.2f}%")
+        print(f"  Total return   : {metrics['total_return']:.2f}%")
+        if not trades_df.empty:
+            print(f"Trade log saved to '{config.trade_log_csv}'.")
+        else:
+            print("No trades generated; trade log not created.")
 
-    if not trades_df.empty:
-        print(f"Trade log saved to '{config.trade_log_csv}'.")
-    else:
-        print("No trades generated; trade log not created.")
+    return trades_df, metrics, equity_series
 
-    return trades_df, metrics
+
+def run_backtest(config: Optional[BacktestConfig] = None) -> Tuple[pd.DataFrame, Dict, pd.Series]:
+    """
+    Run the backtest and return trade log, performance metrics, and equity curve.
+
+    Fetches historical data from Binance, then runs the same engine as
+    run_backtest_with_ohlcv.
+
+    Args:
+        config: Optional BacktestConfig; if None, values are loaded from the
+            environment (falling back to sensible defaults).
+
+    Returns:
+        Tuple of (trades_df, metrics_dict, equity_series).
+    """
+    # Load environment so user can override defaults via .env
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    load_dotenv(dotenv_path=env_path)
+
+    if config is None:
+        config = BacktestConfig(
+            symbol=os.getenv("TRADING_PAIR", "ETHUSDT"),
+            interval=os.getenv("TIMEFRAME", "4h"),
+            initial_capital=float(os.getenv("INITIAL_CAPITAL", "1000.0")),
+            atr_multiplier=float(os.getenv("STOP_LOSS_ATR_MULTIPLIER", "2.0")),
+            daily_loss_limit_percent=float(
+                os.getenv("DAILY_LOSS_LIMIT_PERCENT", "3.0")
+            ),
+            lookback_years=int(os.getenv("BACKTEST_LOOKBACK_YEARS", "8")),
+            trading_fee_percent=float(os.getenv("TRADING_FEE_PERCENT", "0.1")),
+            slippage_percent=float(os.getenv("SLIPPAGE_PERCENT", "0.05")),
+        )
+
+    end_time = datetime.utcnow() - timedelta(minutes=5)
+    start_time = end_time - timedelta(days=365 * config.lookback_years)
+
+    print(
+        f"Fetching data for {config.symbol} {config.interval} from "
+        f"{start_time.date()} to {end_time.date()}..."
+    )
+    ohlcv = fetch_historical_klines(
+        symbol=config.symbol,
+        interval=config.interval,
+        start_time=start_time,
+        end_time=end_time,
+    )
+
+    return run_backtest_with_ohlcv(ohlcv, config, verbose=True)
 
 
 if __name__ == "__main__":

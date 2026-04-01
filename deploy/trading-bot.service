@@ -1,0 +1,15 @@
+[Unit]
+Description=Crypto Trading Bot
+After=network-online.target
+
+[Service]
+Type=simple
+User=trader
+WorkingDirectory=/opt/trading-bot
+ExecStart=/usr/bin/python3 main.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

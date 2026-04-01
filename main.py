@@ -5,7 +5,9 @@ risk management, and order execution.
 This is the entry point for the crypto trading bot.
 """
 
+import json
 import logging
+import math
 import os
 import sys
 import time
@@ -15,17 +17,44 @@ from dotenv import load_dotenv
 
 from data import DataFetcher
 from strategy import TradingStrategy
-from risk import RiskManager
-from execution import OrderExecutor
+from risk import PortfolioRiskEngine, PortfolioStateBuilder, KillSwitch
+from risk.models import RiskDecision, Signal
+from risk.sizing import PositionSizer
+from portfolio import PortfolioAllocator, build_portfolio_context
+from intelligence.portfolio_optimizer import PortfolioOptimizer
+from intelligence.models import build_returns_matrix
+from risk_manager import RiskManager
+from execution import (
+    OrderExecutor,
+    OMS,
+    ExecutionEngine,
+    MultiSymbolExchangeAdapter,
+    FillHandler,
+    PositionManager,
+    ReconciliationEngine,
+)
+from execution.order_model import OrderStatus
 from journal import write_trade_entry
 from notifications import TelegramNotifier
 from equity import log_equity
+from strategy_control.asset_classifier import get_asset_class
+from strategy_control.filters import apply_filters
+from strategy_control.performance_tracker import PerformanceTracker
+from strategy_control.regime_detector import RegimeDetector
+from strategy_control.strategy_context import make_strategy_context
+from strategy_control.strategy_registry import load_strategy
+from strategy_control.strategy_router import StrategyRouter
 
 # Telegram status message throttle: send at most every 4 hours
 STATUS_INTERVAL = timedelta(hours=4)
 
 # Market scanner interval: run every 4 hours when enabled
 SCAN_INTERVAL = timedelta(hours=4)
+
+# Strategy control: max strategies that may place orders per symbol per evaluation
+MAX_STRATEGIES_PER_SYMBOL = 1
+
+_INDICATOR_KEYS_REQUIRED = ("ma50", "ma200", "atr")
 
 # Load environment variables from project directory (reliable regardless of cwd)
 _env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -137,6 +166,7 @@ class TradingBot:
         if not self.trading_pairs:
             self.logger.error("No trading pairs configured (TRADING_PAIRS or TRADING_PAIR)")
             sys.exit(1)
+        self._symbol_index_map = {s: i for i, s in enumerate(self.trading_pairs)}
         trading_pair = self.trading_pairs[0]  # default for initial data_fetcher
         timeframe = os.getenv('TIMEFRAME', '4h')
         paper_trading = os.getenv('PAPER_TRADING', 'False').lower() == 'true'
@@ -190,7 +220,30 @@ class TradingBot:
         }
         self.paper_trading = paper_trading
 
+        self.oms = OMS()
+        self.fill_handler = FillHandler()
+        self.oms_position_manager = PositionManager()
+        self.reconciliation_engine = ReconciliationEngine()
+        self.exchange_adapter = MultiSymbolExchangeAdapter(self.executors)
+        self.execution_engine = ExecutionEngine(self.exchange_adapter)
+        self._oms_order_timeout_seconds = float(
+            os.getenv("OMS_ORDER_TIMEOUT_SECONDS", "0").strip() or "0"
+        )
+
+        self.portfolio_risk_engine = PortfolioRiskEngine()
+        self.portfolio_state_builder = PortfolioStateBuilder(
+            self.data_fetcher.client,
+            symbols=self.trading_pairs,
+            position_enricher=self._position_enricher_for_risk,
+        )
+
         self.notifier = TelegramNotifier()
+
+        self.regime_detector = RegimeDetector()
+        self.strategy_router = StrategyRouter()
+        self.performance_tracker = PerformanceTracker()
+        self.portfolio_allocator = PortfolioAllocator()
+        self.portfolio_optimizer = PortfolioOptimizer()
 
         # Bot state (multi-asset: positions and market_data keyed by symbol)
         self.running = False
@@ -219,6 +272,87 @@ class TradingBot:
             "Execution mode: %s",
             "PAPER (simulated)" if paper_trading else "LIVE (real orders)"
         )
+
+    def _position_enricher_for_risk(self) -> Dict[str, dict]:
+        """Entry/stop for open positions (exchange remains size/equity source of truth)."""
+        out: Dict[str, dict] = {}
+        for sym, pos in self.positions.items():
+            out[sym] = {
+                "entry_price": float(pos["entry_price"]),
+                "stop_loss": float(pos["stop_loss"]),
+                "side": "LONG",
+            }
+        return out
+
+    def _log_risk_decision(self, signal: Signal, decision: RiskDecision) -> None:
+        try:
+            payload = {
+                "symbol": signal.symbol,
+                "decision": bool(decision.allowed),
+                "reason": decision.reason,
+                "portfolio_risk": float(decision.portfolio_risk),
+                "proposed_risk": float(decision.proposed_trade_risk),
+            }
+            self.logger.info("risk_decision %s", json.dumps(payload))
+        except Exception:
+            pass
+
+    def _log_strategy_control(
+        self,
+        event: str,
+        symbol: str,
+        regime: Optional[str] = None,
+        strategy: Optional[str] = None,
+        **extra,
+    ) -> None:
+        """Structured strategy_control logs; must never break execution."""
+        payload = {
+            "event": event,
+            "symbol": symbol,
+            "regime": regime,
+            "strategy": strategy,
+            **extra,
+        }
+        try:
+            self.logger.info("strategy_control %s", json.dumps(payload))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _indicators_from_df(df) -> Optional[Dict]:
+        """Build indicator dict for regime detection and filters from last closed bar."""
+        if df is None or len(df) < 1:
+            return None
+        row = df.iloc[-1]
+
+        def _f(x) -> float:
+            if x is None:
+                return 0.0
+            try:
+                v = float(x)
+                return 0.0 if math.isnan(v) else v
+            except (TypeError, ValueError):
+                return 0.0
+
+        atr_ma = _f(row.get("atr_ma"))
+        # Phase 5: same numeric baseline as atr_threshold (strategy atr_ma); set once per bar
+        atr_baseline = atr_ma
+        return {
+            "ma50": _f(row.get("ma_50")),
+            "ma200": _f(row.get("ma_200")),
+            "atr": _f(row.get("atr")),
+            "atr_threshold": atr_ma,
+            "atr_baseline": float(atr_baseline),
+            "min_atr": atr_ma,
+        }
+
+    @staticmethod
+    def _indicators_complete(indicators: Dict) -> Optional[str]:
+        """Return missing key if any required indicator is absent; else None."""
+        for key in _INDICATOR_KEYS_REQUIRED:
+            if key not in indicators:
+                return key
+        return None
 
     def update_market_data(self, symbol: str) -> bool:
         """
@@ -337,102 +471,311 @@ class TradingBot:
                 symbol, kill_reason
             )
             return
-        
-        # Check entry signal (long only; strategy unchanged)
-        entry_signal, signal_details = self.strategy.check_entry_signal(df)
-        
-        if not entry_signal:
+
+        indicators = self._indicators_from_df(df)
+        if indicators is None:
             return
-        
-        try:
-            stop_loss = self.strategy.calculate_stop_loss(
-                signal_details['entry_price'],
-                signal_details['atr']
-            )
-            
-            position_size = self.risk_manager.calculate_position_size(
-                signal_details['entry_price'],
-                stop_loss,
-                risk_percent=1.0
-            )
-            
-            if position_size <= 0:
-                self.logger.warning("Invalid position size calculated")
-                return
-            
-            required_usdt = position_size * signal_details['entry_price']
-            can_add, exposure_reason = self.risk_manager.can_add_position(
-                total_exposure, required_usdt
-            )
-            if not can_add:
-                self.logger.debug(
-                    "symbol=%s skip_entry: %s", symbol, exposure_reason
-                )
-                return
-            
-            if self.paper_trading:
-                usdt_balance = self.risk_manager.get_risk_status()['current_capital']
-            else:
-                self.data_fetcher.set_trading_pair(symbol, self.data_fetcher.timeframe or '4h')
-                balances = self.data_fetcher.get_account_balance()
-                if balances is None:
-                    return
-                usdt_balance = balances.get('USDT', 0.0)
-            
-            if required_usdt > usdt_balance:
-                self.logger.warning(
-                    "symbol=%s insufficient balance: need %.2f, have %.2f",
-                    symbol, required_usdt, usdt_balance
-                )
-                return
-            
-            executor = self.executors[symbol]
-            buy_order = executor.place_market_buy_order(position_size)
-            if buy_order is None:
-                self.logger.error("symbol=%s failed to place buy order", symbol)
-                return
 
-            entry_price = buy_order.get('price') or signal_details['entry_price']
-            executed_qty = buy_order.get('quantity', 0) or 0
-            if executed_qty <= 0:
-                self.logger.error("symbol=%s buy order returned no executed quantity", symbol)
-                return
-
-            self.positions[symbol] = {
-                'entry_price': entry_price,
-                'entry_time': datetime.now(timezone.utc),
-                'quantity': executed_qty,
-                'stop_loss': stop_loss,
-                'entry_signal': signal_details,
-                'buy_order': buy_order
-            }
-            
-            stop_order = executor.place_stop_loss_order(executed_qty, stop_loss)
-            if stop_order:
-                self.positions[symbol]['stop_order'] = stop_order
-            
-            timeframe = self.data_fetcher.timeframe or '4h'
-            entry_state = "PAPER_ENTRY" if self.paper_trading else "LIVE_ENTRY"
-            self.logger.info(
-                "symbol=%s timeframe=%s state=%s executed_qty=%.6f "
-                "entry_price=%.2f stop_loss=%.2f",
-                symbol, timeframe, entry_state, executed_qty, entry_price, stop_loss
+        missing = self._indicators_complete(indicators)
+        if missing is not None:
+            self._log_strategy_control(
+                "missing_indicator",
+                symbol,
+                regime=None,
+                strategy=None,
+                missing=missing,
             )
+            return
+
+        asset_class = get_asset_class(symbol)
+        if asset_class == "unknown":
+            self._log_strategy_control(
+                "unknown_asset_class",
+                symbol,
+                regime=None,
+                strategy=None,
+            )
+            return
+
+        regime = self.regime_detector.detect(symbol, indicators)
+        self._log_strategy_control(
+            "regime_detected",
+            symbol,
+            regime=regime,
+            strategy=None,
+        )
+
+        strategies = self.strategy_router.get_strategies(asset_class, regime)
+
+        if not strategies:
+            self._log_strategy_control(
+                "no_strategy",
+                symbol,
+                regime=regime,
+                strategy=None,
+                asset_class=asset_class,
+            )
+            return
+
+        price_data = {"df": df, "data_client": self.data_fetcher}
+        executed = 0
+
+        for strategy_name in strategies:
+            if executed >= MAX_STRATEGIES_PER_SYMBOL:
+                break
+
+            strategy_impl = load_strategy(strategy_name, self.strategy)
+            if strategy_impl is None:
+                continue
+
+            context = make_strategy_context(
+                symbol,
+                asset_class,
+                regime,
+                indicators,
+                price_data,
+            )
+            signal = strategy_impl.generate(context)
+            if not signal:
+                continue
+            if not apply_filters(signal, context):
+                self._log_strategy_control(
+                    "filter_blocked",
+                    symbol,
+                    regime=regime,
+                    strategy=strategy_name,
+                )
+                continue
+
+            self._log_strategy_control(
+                "strategy_selected",
+                symbol,
+                regime=regime,
+                strategy=strategy_name,
+                asset_class=asset_class,
+            )
+
+            signal_details = signal["signal_details"]
+            strategy_name_used = strategy_name
 
             try:
-                self.notifier.notify_entry(
-                    {**self.positions[symbol], 'symbol': symbol}
-                )
-            except Exception as notify_err:
-                self.logger.warning(
-                    "state=NOTIFY_FAIL action=notify_entry error=%s", notify_err
+                stop_loss = self.strategy.calculate_stop_loss(
+                    signal_details['entry_price'],
+                    signal_details['atr']
                 )
 
-        except Exception as e:
-            entry_state = "PAPER_ENTRY" if self.paper_trading else "LIVE_ENTRY"
-            self.logger.error(
-                "symbol=%s state=%s error: %s", symbol, entry_state, e
-            )
+                if KillSwitch.is_active():
+                    self.logger.warning("BLOCKED: Kill switch active")
+                    return
+
+                portfolio = self.portfolio_state_builder.build()
+                sig = Signal(
+                    symbol=symbol,
+                    side="LONG",
+                    entry_price=float(signal_details["entry_price"]),
+                    stop_loss=float(stop_loss),
+                )
+                strategy_by_symbol = {
+                    sym: str(pos.get("strategy_name", "unknown"))
+                    for sym, pos in self.positions.items()
+                }
+                portfolio_context = build_portfolio_context(
+                    portfolio,
+                    strategy_by_symbol,
+                    self.performance_tracker.get_all_stats(),
+                )
+                base_size = PositionSizer.position_size_from_risk(
+                    sig,
+                    PositionSizer.calculate(sig, portfolio),
+                )
+                adjusted_size = self.portfolio_allocator.adjust_size(
+                    strategy_name_used,
+                    symbol,
+                    base_size,
+                    portfolio_context,
+                )
+                if adjusted_size <= 0:
+                    try:
+                        self.logger.info(
+                            "allocation_blocked %s",
+                            json.dumps(
+                                {
+                                    "event": "allocation_blocked",
+                                    "strategy": strategy_name_used,
+                                    "symbol": symbol,
+                                }
+                            ),
+                        )
+                    except Exception:
+                        self.logger.info(
+                            "allocation_blocked strategy=%s symbol=%s",
+                            strategy_name_used,
+                            symbol,
+                        )
+                    continue
+
+                returns_matrix = build_returns_matrix(
+                    self.trading_pairs, self.market_data
+                )
+                symbol_idx = self._symbol_index_map[symbol]
+                stats = self.performance_tracker.get_strategy_stats(strategy_name_used)
+                opt_context = {
+                    "strategy": strategy_name_used,
+                    "regime": regime,
+                    "stats": stats if stats else {},
+                    "atr": float(indicators.get("atr", 0)),
+                    "atr_baseline": float(indicators.get("atr_baseline", indicators.get("atr_threshold", 0))),
+                    "returns_matrix": returns_matrix,
+                    "symbol_idx": symbol_idx,
+                }
+                optimized_size = self.portfolio_optimizer.optimize(
+                    adjusted_size, opt_context
+                )
+                if optimized_size <= 0:
+                    continue
+
+                account_state = self.risk_manager.get_account_risk_state(portfolio.equity)
+                decision = self.portfolio_risk_engine.evaluate(
+                    sig, portfolio, account_state, size_override=optimized_size
+                )
+                self._log_risk_decision(sig, decision)
+                if not decision.allowed:
+                    self.logger.warning("BLOCKED: %s", decision.reason)
+                    continue
+
+                position_size = decision.size
+
+                if position_size <= 0:
+                    self.logger.warning("Invalid position size from risk engine")
+                    continue
+
+                required_usdt = position_size * signal_details['entry_price']
+                can_add, exposure_reason = self.risk_manager.can_add_position(
+                    total_exposure, required_usdt
+                )
+                if not can_add:
+                    self.logger.debug(
+                        "symbol=%s skip_entry: %s", symbol, exposure_reason
+                    )
+                    continue
+
+                if self.paper_trading:
+                    usdt_balance = self.risk_manager.get_risk_status()['current_capital']
+                else:
+                    self.data_fetcher.set_trading_pair(symbol, self.data_fetcher.timeframe or '4h')
+                    balances = self.data_fetcher.get_account_balance()
+                    if balances is None:
+                        continue
+                    usdt_balance = balances.get('USDT', 0.0)
+
+                if required_usdt > usdt_balance:
+                    self.logger.warning(
+                        "symbol=%s insufficient balance: need %.2f, have %.2f",
+                        symbol, required_usdt, usdt_balance
+                    )
+                    continue
+
+                order = self.oms.create_order(symbol, "BUY", position_size, "MARKET")
+                if not order:
+                    self.logger.info("symbol=%s Duplicate order blocked", symbol)
+                    continue
+
+                result = self.execution_engine.submit_order(order)
+                if not result.get("success"):
+                    self.oms.mark_rejected(order)
+                    self.logger.error(
+                        "symbol=%s failed to place buy order: %s",
+                        symbol,
+                        result.get("error"),
+                    )
+                    continue
+
+                ex_id = result.get("exchange_order_id")
+                if not ex_id:
+                    self.oms.mark_rejected(order)
+                    self.logger.error("symbol=%s buy order missing exchange id", symbol)
+                    continue
+
+                raw = result.get("raw") or {}
+                order["exchange_order_id"] = ex_id
+                order["updated_at"] = datetime.now(timezone.utc).isoformat()
+                qty = float(raw.get("quantity", 0) or 0)
+                px = raw.get("price")
+                prev_filled = float(order.get("filled_quantity", 0) or 0)
+                if qty > 0 and px is not None:
+                    self.fill_handler.process_fill(
+                        order,
+                        qty,
+                        float(px),
+                        persist_after=self.oms._persist,
+                    )
+                    new_filled = float(order.get("filled_quantity", 0) or 0)
+                    self.oms_position_manager.apply_fill_delta(
+                        symbol, order["side"], prev_filled, new_filled
+                    )
+                else:
+                    order["status"] = OrderStatus.SUBMITTED.value
+                    order["updated_at"] = datetime.now(timezone.utc).isoformat()
+                self.oms._persist()
+
+                buy_order = raw
+                entry_price = (
+                    float(order["price"])
+                    if order.get("price") is not None
+                    else (float(px) if px is not None else signal_details["entry_price"])
+                )
+                executed_qty = float(order.get("filled_quantity", 0) or 0)
+                if executed_qty <= 0:
+                    self.logger.error(
+                        "symbol=%s buy order returned no executed quantity", symbol
+                    )
+                    continue
+
+                self.positions[symbol] = {
+                    'entry_price': entry_price,
+                    'entry_time': datetime.now(timezone.utc),
+                    'quantity': executed_qty,
+                    'stop_loss': stop_loss,
+                    'entry_signal': signal_details,
+                    'buy_order': buy_order,
+                    'strategy_name': strategy_name_used,
+                    'entry_regime': regime,
+                }
+
+                executor = self.executors[symbol]
+                stop_order = executor.place_stop_loss_order(executed_qty, stop_loss)
+                if stop_order:
+                    self.positions[symbol]['stop_order'] = stop_order
+
+                timeframe = self.data_fetcher.timeframe or '4h'
+                entry_state = "PAPER_ENTRY" if self.paper_trading else "LIVE_ENTRY"
+                self.logger.info(
+                    "symbol=%s timeframe=%s state=%s executed_qty=%.6f "
+                    "entry_price=%.2f stop_loss=%.2f",
+                    symbol, timeframe, entry_state, executed_qty, entry_price, stop_loss
+                )
+
+                try:
+                    self.notifier.notify_entry(
+                        {**self.positions[symbol], 'symbol': symbol}
+                    )
+                except Exception as notify_err:
+                    self.logger.warning(
+                        "state=NOTIFY_FAIL action=notify_entry error=%s", notify_err
+                    )
+
+                executed += 1
+
+            except Exception as e:
+                entry_state = "PAPER_ENTRY" if self.paper_trading else "LIVE_ENTRY"
+                self.logger.critical(
+                    "CRITICAL ERROR symbol=%s state=%s: %s", symbol, entry_state, e
+                )
+                try:
+                    KillSwitch.trigger("System failure")
+                except Exception:
+                    pass
+                return
 
     def check_and_exit_position(self, symbol: str):
         """Check for exit signals and exit position if conditions are met for symbol."""
@@ -461,17 +804,71 @@ class TradingBot:
             
             if exit_signal or stop_loss_hit:
                 quantity = pos['quantity']
-                executor = self.executors[symbol]
-                sell_order = executor.place_market_sell_order(quantity)
-                if sell_order is None:
-                    self.logger.error("symbol=%s failed to place sell order", symbol)
+                order = self.oms.create_order(symbol, "SELL", quantity, "MARKET")
+                if not order:
+                    self.logger.info("symbol=%s Duplicate order blocked (exit)", symbol)
                     return
 
-                exit_price = sell_order.get('price') or current_price
-                executed_sell_qty = sell_order.get('quantity', 0) or quantity
+                result = self.execution_engine.submit_order(order)
+                if not result.get("success"):
+                    self.oms.mark_rejected(order)
+                    self.logger.error(
+                        "symbol=%s failed to place sell order: %s",
+                        symbol,
+                        result.get("error"),
+                    )
+                    return
+
+                ex_id = result.get("exchange_order_id")
+                if not ex_id:
+                    self.oms.mark_rejected(order)
+                    self.logger.error("symbol=%s sell order missing exchange id", symbol)
+                    return
+
+                raw = result.get("raw") or {}
+                order["exchange_order_id"] = ex_id
+                order["updated_at"] = datetime.now(timezone.utc).isoformat()
+                qty = float(raw.get("quantity", 0) or 0)
+                px = raw.get("price")
+                prev_filled = float(order.get("filled_quantity", 0) or 0)
+                if qty > 0 and px is not None:
+                    self.fill_handler.process_fill(
+                        order,
+                        qty,
+                        float(px),
+                        persist_after=self.oms._persist,
+                    )
+                    new_filled = float(order.get("filled_quantity", 0) or 0)
+                    self.oms_position_manager.apply_fill_delta(
+                        symbol, order["side"], prev_filled, new_filled
+                    )
+                else:
+                    order["status"] = OrderStatus.SUBMITTED.value
+                    order["updated_at"] = datetime.now(timezone.utc).isoformat()
+                self.oms._persist()
+
+                sell_order = raw
+                exit_price = (
+                    float(order["price"])
+                    if order.get("price") is not None
+                    else (float(px) if px is not None else current_price)
+                )
+                executed_sell_qty = float(order.get("filled_quantity", 0) or 0)
+                if executed_sell_qty <= 0:
+                    self.logger.error(
+                        "symbol=%s sell order returned no executed quantity", symbol
+                    )
+                    return
                 pnl = (exit_price - entry_price) * executed_sell_qty
                 pnl_percent = ((exit_price - entry_price) / entry_price) * 100
-                
+
+                self.performance_tracker.log_trade(
+                    pos.get("strategy_name", "unknown"),
+                    pnl,
+                    symbol,
+                    pos.get("entry_regime", "unknown"),
+                )
+
                 trade_result = {
                     'entry_price': entry_price,
                     'exit_price': exit_price,
@@ -552,6 +949,20 @@ class TradingBot:
         try:
             while self.running:
                 try:
+                    self.risk_manager.sync_kill_switch_from_file()
+
+                    if self._oms_order_timeout_seconds > 0:
+                        self.oms.cancel_stale_orders(
+                            self.exchange_adapter,
+                            self._oms_order_timeout_seconds,
+                        )
+                    self.reconciliation_engine.reconcile(
+                        self.oms,
+                        self.exchange_adapter,
+                        paper_trading=self.paper_trading,
+                    )
+                    self.oms._persist()
+
                     # Update market data for all symbols
                     any_update_ok = False
                     for sym in self.trading_pairs:

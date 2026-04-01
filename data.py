@@ -5,6 +5,7 @@ This module handles all interactions with the Binance API for retrieving
 candlestick data, account information, and current prices.
 """
 
+import json
 import logging
 import time
 from typing import Optional, Dict, List, Tuple
@@ -16,6 +17,38 @@ import pandas as pd
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+def log_event(event: dict) -> None:
+    """Structured JSON log line for observability; never raises."""
+    try:
+        logger.info(json.dumps(event))
+    except Exception:
+        logger.info(str(event))
+
+
+def validate_time_continuity(df: pd.DataFrame, interval: str) -> None:
+    """Ensure candle open times advance by exactly one interval with no gaps."""
+    timeframe_map = {
+        "1m": "1min",
+        "5m": "5min",
+        "15m": "15min",
+        "1h": "1h",
+        "4h": "4h",
+        "1d": "1d",
+    }
+
+    expected_freq = timeframe_map.get(interval)
+
+    if expected_freq is None:
+        return
+
+    diffs = df.index.to_series().diff().dropna()
+
+    expected_delta = pd.Timedelta(expected_freq)
+
+    if not (diffs == expected_delta).all():
+        raise RuntimeError("CRITICAL: time gap detected in candles")
 
 
 class DataFetcher:
@@ -111,98 +144,198 @@ class DataFetcher:
             return False
         return True
 
+    def safe_get_klines(self, params: Dict, retries: int = 3) -> List:
+        """
+        Call Binance get_klines with exponential backoff; re-raises on final failure.
+        """
+        for attempt in range(retries):
+            try:
+                return self.client.get_klines(**params)
+            except Exception:
+                if attempt == retries - 1:
+                    raise
+
+                sleep_time = 2 ** attempt
+                time.sleep(sleep_time)
+
+    def get_klines_full(self, symbol: str, interval: str, required: int = 500) -> List:
+        """
+        Fetch historical klines using pagination to guarantee required candle count.
+        """
+        if not symbol or not interval:
+            raise ValueError("symbol and interval must be set")
+
+        all_klines: List = []
+        end_time: Optional[int] = None
+
+        max_loops = 10  # safety to prevent infinite loops
+
+        for _ in range(max_loops):
+            params: Dict = {
+                "symbol": symbol,
+                "interval": interval,
+                "limit": 1000,
+            }
+
+            if end_time is not None:
+                params["endTime"] = end_time
+
+            batch = self.safe_get_klines(params)
+
+            if batch is None:
+                raise RuntimeError("CRITICAL: API returned None")
+
+            if not batch:
+                break
+
+            all_klines = batch + all_klines
+
+            # Move backwards in time
+            end_time = batch[0][0] - 1
+
+            if len(all_klines) >= required:
+                break
+
+            # If batch smaller than max, no more data
+            if len(batch) < 1000:
+                break
+
+        if len(all_klines) < required:
+            raise RuntimeError(
+                f"CRITICAL: insufficient klines fetched ({len(all_klines)} < {required})"
+            )
+
+        log_event(
+            {
+                "event": "data_fetch",
+                "symbol": symbol,
+                "interval": interval,
+                "candles_fetched": len(all_klines),
+            }
+        )
+
+        return all_klines[-required:]
+
+    def klines_to_dataframe(self, klines: List) -> pd.DataFrame:
+        """Convert raw Binance kline rows to a typed DataFrame (open_time as datetime)."""
+        df = pd.DataFrame(
+            klines,
+            columns=[
+                "open_time",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "close_time",
+                "quote_asset_volume",
+                "number_of_trades",
+                "taker_buy_base",
+                "taker_buy_quote",
+                "ignore",
+            ],
+        )
+
+        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+
+        numeric_cols = ["open", "high", "low", "close", "volume"]
+        df[numeric_cols] = df[numeric_cols].astype(float)
+
+        return df
+
+    def _klines_to_ohlcv_indexed(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Legacy trading DataFrame: DatetimeIndex named 'datetime', OHLCV only.
+        Raises if OHLCV contains NaN (no silent row drops).
+        """
+        numeric_cols = ["open", "high", "low", "close", "volume"]
+        if df[numeric_cols].isna().any().any():
+            raise RuntimeError(
+                "CRITICAL: invalid OHLCV data (NaN in open/high/low/close/volume)"
+            )
+
+        out = df.copy()
+        out["datetime"] = out["open_time"]
+        out = out.set_index("datetime")
+        out = out[["open", "high", "low", "close", "volume"]]
+        return out
+
     def get_klines(self, limit: int = 500) -> Optional[pd.DataFrame]:
         """
-        Fetch candlestick data from Binance with retries.
-
-        Retries up to 3 times on failure with a short delay between attempts.
-        Fails gracefully after retries exhausted.
-
-        Args:
-            limit: Number of klines to fetch (default: 500)
+        Fetch candlestick data using paginated history; guarantees `limit` closed rows.
 
         Returns:
-            DataFrame with OHLCV data, or None if error occurs after retries
+            DataFrame with OHLCV indexed by datetime, or None if symbol/timeframe unset.
+        Raises:
+            RuntimeError if history is insufficient, data is invalid, or API fails after retries.
         """
         if not self._require_symbol_timeframe():
             return None
 
-        max_retries = 3
-        retry_delay_seconds = 2.0
+        assert self.symbol is not None and self.timeframe is not None
 
-        for attempt in range(1, max_retries + 1):
-            try:
-                klines = self.client.get_klines(
-                    symbol=self.symbol,
-                    interval=self.timeframe,
-                    limit=limit
+        try:
+            start_time = time.time()
+            klines = self.get_klines_full(
+                self.symbol, self.timeframe, required=limit
+            )
+            df = self.klines_to_dataframe(klines)
+            df = self._klines_to_ohlcv_indexed(df)
+
+            if df.index.duplicated().any():
+                raise RuntimeError("CRITICAL: duplicate candles detected")
+
+            validate_time_continuity(df, self.timeframe)
+
+            # HARD VALIDATION
+            if len(df) < 200:
+                raise RuntimeError(
+                    f"CRITICAL: insufficient candles for indicators ({len(df)})"
                 )
 
-                df = pd.DataFrame(
-                    klines,
-                    columns=[
-                        'timestamp', 'open', 'high', 'low', 'close',
-                        'volume', 'close_time', 'quote_volume', 'trades',
-                        'taker_buy_base', 'taker_buy_quote', 'ignore'
-                    ]
-                )
+            duration = time.time() - start_time
 
-                # Convert to numeric types
-                numeric_columns = ['open', 'high', 'low', 'close', 'volume']
-                for col in numeric_columns:
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
-                # Drop rows with NaN in OHLCV to avoid bad indicator inputs
-                df = df.dropna(subset=numeric_columns)
+            self.consecutive_errors = 0
+            logger.info(
+                "symbol=%s timeframe=%s candles_fetched=%d",
+                self.symbol,
+                self.timeframe,
+                len(df),
+            )
+            log_event(
+                {
+                    "event": "data_fetch_complete",
+                    "symbol": self.symbol,
+                    "interval": self.timeframe,
+                    "candles_returned": len(df),
+                    "duration_sec": round(duration, 3),
+                }
+            )
+            return df
 
-                # Convert timestamp to datetime
-                df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
-                df = df.set_index('datetime')
+        except BinanceAPIException as e:
+            self.consecutive_errors += 1
+            logger.error(
+                "symbol=%s timeframe=%s get_klines BinanceAPIException: %s",
+                self.symbol,
+                self.timeframe,
+                e,
+            )
+            raise RuntimeError(f"CRITICAL: Binance klines fetch failed: {e}") from e
 
-                # Keep only necessary columns
-                df = df[['open', 'high', 'low', 'close', 'volume']]
+        except RuntimeError:
+            self.consecutive_errors += 1
+            raise
 
-                self.consecutive_errors = 0
-                logger.info(
-                    "symbol=%s timeframe=%s candles_fetched=%d",
-                    self.symbol, self.timeframe, len(df)
-                )
-                return df
-
-            except BinanceAPIException as e:
-                self.consecutive_errors += 1
-                logger.warning(
-                    "symbol=%s timeframe=%s get_klines retry attempt=%d/%d "
-                    "BinanceAPIException: %s",
-                    self.symbol, self.timeframe, attempt, max_retries, e
-                )
-                if attempt < max_retries:
-                    time.sleep(retry_delay_seconds)
-                else:
-                    logger.error(
-                        "symbol=%s timeframe=%s get_klines failed after %d "
-                        "retries (last error: %s)",
-                        self.symbol, self.timeframe, max_retries, e
-                    )
-                    return None
-
-            except Exception as e:
-                self.consecutive_errors += 1
-                logger.warning(
-                    "symbol=%s timeframe=%s get_klines retry attempt=%d/%d "
-                    "error: %s",
-                    self.symbol, self.timeframe, attempt, max_retries, e
-                )
-                if attempt < max_retries:
-                    time.sleep(retry_delay_seconds)
-                else:
-                    logger.error(
-                        "symbol=%s timeframe=%s get_klines failed after %d "
-                        "retries (last error: %s)",
-                        self.symbol, self.timeframe, max_retries, e
-                    )
-                    return None
-
-        return None
+        except Exception as e:
+            self.consecutive_errors += 1
+            logger.error(
+                "symbol=%s timeframe=%s get_klines error: %s",
+                self.symbol,
+                self.timeframe,
+                e,
+            )
+            raise RuntimeError(f"CRITICAL: klines fetch failed: {e}") from e
 
     def get_current_price(self) -> Optional[float]:
         """
