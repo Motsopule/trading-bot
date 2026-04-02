@@ -69,22 +69,13 @@ class DataFetcher:
         Args:
             api_key: Binance API key
             api_secret: Binance API secret
-            testnet: Whether to use Binance testnet (default: True)
+            testnet: Execution/testnet mode flag (stored for callers; market data always uses mainnet)
         """
         self.testnet = testnet
-        if testnet:
-            self.client = Client(
-                api_key=api_key,
-                api_secret=api_secret,
-                testnet=True
-            )
-            # Force Spot Testnet URL (python-binance can default to live despite testnet=True)
-            self.client.API_URL = "https://testnet.binance.vision/api"
-        else:
-            self.client = Client(
-                api_key=api_key,
-                api_secret=api_secret
-            )
+        # Always use mainnet for market data
+        self.client = Client(api_key, api_secret)
+        # Force mainnet endpoint explicitly
+        self.client.API_URL = "https://api.binance.com/api"
 
         self.symbol = None
         self.timeframe = None
