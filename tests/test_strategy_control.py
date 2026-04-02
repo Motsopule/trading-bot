@@ -2,6 +2,7 @@
 Tests for Phase 3: strategy control (regime, routing, filters, integration).
 """
 
+import json
 import unittest
 from unittest.mock import MagicMock
 
@@ -89,6 +90,13 @@ class TestStrategyRouting(unittest.TestCase):
         router = StrategyRouter()
         self.assertEqual(router.get_strategies("crypto", "TRENDING"), ["trend_strategy"])
 
+    def test_high_vol_routes_like_trending(self):
+        router = StrategyRouter()
+        strategies = router.route("crypto", "HIGH_VOL")
+        strategies_trending = router.route("crypto", "TRENDING")
+        self.assertEqual(strategies, strategies_trending)
+        self.assertEqual(strategies, ["trend_strategy"])
+
     def test_forex_trending_empty(self):
         router = StrategyRouter()
         self.assertEqual(router.get_strategies("forex", "TRENDING"), [])
@@ -120,7 +128,7 @@ class TestFilters(unittest.TestCase):
 
 
 class TestPerSymbolRegime(unittest.TestCase):
-    def test_btc_trending_eurusd_ranging_different_strategies(self):
+    def test_btc_trending_eurusd_unknown_no_strategies(self):
         det = RegimeDetector()
         router = StrategyRouter()
         btc = "BTCUSDT"
@@ -133,10 +141,40 @@ class TestPerSymbolRegime(unittest.TestCase):
         self.assertEqual(r_btc, "TRENDING")
         self.assertEqual(r_fx, "RANGING")
 
+        self.assertEqual(get_asset_class(eurusd), "unknown")
         s_btc = router.get_strategies(get_asset_class(btc), r_btc)
         s_fx = router.get_strategies(get_asset_class(eurusd), r_fx)
         self.assertEqual(s_btc, ["trend_strategy"])
-        self.assertEqual(s_fx, ["mean_reversion_strategy"])
+        self.assertEqual(s_fx, [])
+
+
+class TestAssetClassification(unittest.TestCase):
+    def test_usdt_pairs_are_crypto(self):
+        self.assertEqual(get_asset_class("BNBUSDT"), "crypto")
+        self.assertEqual(get_asset_class("SOLUSDT"), "crypto")
+
+    def test_non_usdt_unknown(self):
+        self.assertEqual(get_asset_class("EURUSD"), "unknown")
+
+
+class TestHighVolNormalizationLogging(unittest.TestCase):
+    def test_regime_normalized_log_emitted(self):
+        router = StrategyRouter()
+        with self.assertLogs("strategy_control.strategy_router", level="INFO") as cm:
+            router.route("crypto", "HIGH_VOL", symbol="BNBUSDT")
+        found = False
+        for line in cm.output:
+            if "regime_normalized" not in line:
+                continue
+            brace = line.find("{")
+            self.assertGreaterEqual(brace, 0, msg=line)
+            data = json.loads(line[brace:])
+            self.assertEqual(data["event"], "regime_normalized")
+            self.assertEqual(data["from"], "HIGH_VOL")
+            self.assertEqual(data["to"], "TRENDING")
+            self.assertEqual(data["symbol"], "BNBUSDT")
+            found = True
+        self.assertTrue(found)
 
 
 class _AlwaysSignal:

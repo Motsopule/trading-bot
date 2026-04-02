@@ -505,7 +505,9 @@ class TradingBot:
             strategy=None,
         )
 
-        strategies = self.strategy_router.get_strategies(asset_class, regime)
+        strategies = self.strategy_router.get_strategies(
+            asset_class, regime, symbol=symbol
+        )
 
         if not strategies:
             self._log_strategy_control(
