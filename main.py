@@ -261,6 +261,8 @@ class TradingBot:
         )
         self.last_scan_time = datetime.now(timezone.utc) - SCAN_INTERVAL
 
+        self.signal_stats: Dict[str, Dict[str, int]] = {}
+
         self.logger.info("Trading bot initialized successfully")
         self.logger.info(
             "Trading pairs: %s, Timeframe: %s",
@@ -552,12 +554,24 @@ class TradingBot:
             )
             signal = strategy_impl.generate(context)
             if not signal:
-                self._log_strategy_control(
-                    event="no_signal",
-                    symbol=symbol,
-                    regime=effective_regime,
-                    strategy=strategy_name,
+                fail_reason = getattr(
+                    strategy_impl, "_last_no_signal_reason", None
                 )
+                if fail_reason:
+                    self._log_strategy_control(
+                        event="condition_failed",
+                        symbol=symbol,
+                        regime=effective_regime,
+                        strategy=strategy_name,
+                        reason=fail_reason,
+                    )
+                else:
+                    self._log_strategy_control(
+                        event="no_signal",
+                        symbol=symbol,
+                        regime=effective_regime,
+                        strategy=strategy_name,
+                    )
                 continue
             if not apply_filters(signal, context):
                 self._log_strategy_control(
@@ -574,6 +588,20 @@ class TradingBot:
                 regime=effective_regime,
                 strategy=strategy_name,
                 asset_class=asset_class,
+            )
+
+            today = datetime.now(timezone.utc).date().isoformat()
+            if symbol not in self.signal_stats:
+                self.signal_stats[symbol] = {}
+            if today not in self.signal_stats[symbol]:
+                self.signal_stats[symbol][today] = 0
+            self.signal_stats[symbol][today] += 1
+            self._log_strategy_control(
+                event="signal_stats",
+                symbol=symbol,
+                regime=effective_regime,
+                strategy=strategy_name,
+                signals_today=self.signal_stats[symbol][today],
             )
 
             signal_details = signal["signal_details"]
