@@ -9,11 +9,8 @@ logger = logging.getLogger(__name__)
 class StrategyRouter:
 
     def get_strategies(self, asset_class, regime, symbol=None):
-        original_regime = regime
-        # Normalize regime for routing
+        effective_regime = "TRENDING" if regime == "HIGH_VOL" else regime
         if regime == "HIGH_VOL":
-            regime = "TRENDING"
-        if original_regime == "HIGH_VOL":
             logger.info(
                 json.dumps(
                     {
@@ -24,7 +21,10 @@ class StrategyRouter:
                     }
                 )
             )
-        return STRATEGY_REGISTRY.get(asset_class, {}).get(regime, [])
+        strategies = STRATEGY_REGISTRY.get(asset_class, {}).get(
+            effective_regime, []
+        )
+        return strategies, effective_regime
 
     def route(self, asset_class, regime, symbol=None):
         return self.get_strategies(asset_class, regime, symbol=symbol)

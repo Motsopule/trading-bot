@@ -88,18 +88,24 @@ class TestRegimePersistence(unittest.TestCase):
 class TestStrategyRouting(unittest.TestCase):
     def test_crypto_trending(self):
         router = StrategyRouter()
-        self.assertEqual(router.get_strategies("crypto", "TRENDING"), ["trend_strategy"])
+        strategies, effective = router.get_strategies("crypto", "TRENDING")
+        self.assertEqual(strategies, ["trend_strategy"])
+        self.assertEqual(effective, "TRENDING")
 
     def test_high_vol_routes_like_trending(self):
         router = StrategyRouter()
-        strategies = router.route("crypto", "HIGH_VOL")
-        strategies_trending = router.route("crypto", "TRENDING")
+        strategies, er_high = router.route("crypto", "HIGH_VOL")
+        strategies_trending, er_trend = router.route("crypto", "TRENDING")
         self.assertEqual(strategies, strategies_trending)
         self.assertEqual(strategies, ["trend_strategy"])
+        self.assertEqual(er_high, "TRENDING")
+        self.assertEqual(er_trend, "TRENDING")
 
     def test_forex_trending_empty(self):
         router = StrategyRouter()
-        self.assertEqual(router.get_strategies("forex", "TRENDING"), [])
+        strategies, effective = router.get_strategies("forex", "TRENDING")
+        self.assertEqual(strategies, [])
+        self.assertEqual(effective, "TRENDING")
 
 
 class TestFilters(unittest.TestCase):
@@ -142,8 +148,8 @@ class TestPerSymbolRegime(unittest.TestCase):
         self.assertEqual(r_fx, "RANGING")
 
         self.assertEqual(get_asset_class(eurusd), "unknown")
-        s_btc = router.get_strategies(get_asset_class(btc), r_btc)
-        s_fx = router.get_strategies(get_asset_class(eurusd), r_fx)
+        s_btc, _ = router.get_strategies(get_asset_class(btc), r_btc)
+        s_fx, _ = router.get_strategies(get_asset_class(eurusd), r_fx)
         self.assertEqual(s_btc, ["trend_strategy"])
         self.assertEqual(s_fx, [])
 
@@ -194,13 +200,13 @@ class _NeverSignal:
 
 
 def _simulate_controlled_entry(router, regime, asset_class, indicators, adapter):
-    strategies = router.get_strategies(asset_class, regime)
+    strategies, effective_regime = router.get_strategies(asset_class, regime)
     if not strategies:
         return {"executed": False, "reason": "no_strategy"}
     ctx = StrategyContext(
         symbol="BTCUSDT",
         asset_class=asset_class,
-        regime=regime,
+        regime=effective_regime,
         indicators=indicators,
         price_data={},
     )
@@ -209,7 +215,11 @@ def _simulate_controlled_entry(router, regime, asset_class, indicators, adapter)
         return {"executed": False, "reason": "no_signal"}
     if not apply_filters(sig, ctx):
         return {"executed": False, "reason": "filter"}
-    return {"executed": True, "reason": "ok"}
+    return {
+        "executed": True,
+        "reason": "ok",
+        "effective_regime": effective_regime,
+    }
 
 
 class TestIntegration(unittest.TestCase):
@@ -220,6 +230,15 @@ class TestIntegration(unittest.TestCase):
             router, "TRENDING", "crypto", ind, _AlwaysSignal()
         )
         self.assertTrue(out["executed"])
+
+    def test_high_vol_uses_normalized_regime_in_context(self):
+        router = StrategyRouter()
+        ind = _base_indicators(trending=True, high_atr=True)
+        out = _simulate_controlled_entry(
+            router, "HIGH_VOL", "crypto", ind, _AlwaysSignal()
+        )
+        self.assertTrue(out["executed"])
+        self.assertEqual(out["effective_regime"], "TRENDING")
 
     def test_invalid_regime_blocks_before_strategy(self):
         router = StrategyRouter()

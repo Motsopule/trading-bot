@@ -505,7 +505,7 @@ class TradingBot:
             strategy=None,
         )
 
-        strategies = self.strategy_router.get_strategies(
+        strategies, effective_regime = self.strategy_router.get_strategies(
             asset_class, regime, symbol=symbol
         )
 
@@ -513,7 +513,7 @@ class TradingBot:
             self._log_strategy_control(
                 event="no_strategy",
                 symbol=symbol,
-                regime=regime,
+                regime=effective_regime,
                 strategy=None,
                 asset_class=asset_class,
             )
@@ -529,7 +529,7 @@ class TradingBot:
             self._log_strategy_control(
                 event="strategy_attempt",
                 symbol=symbol,
-                regime=regime,
+                regime=effective_regime,
                 strategy=strategy_name,
             )
 
@@ -538,7 +538,7 @@ class TradingBot:
                 self._log_strategy_control(
                     event="no_signal",
                     symbol=symbol,
-                    regime=regime,
+                    regime=effective_regime,
                     strategy=strategy_name,
                 )
                 continue
@@ -546,7 +546,7 @@ class TradingBot:
             context = make_strategy_context(
                 symbol,
                 asset_class,
-                regime,
+                effective_regime,
                 indicators,
                 price_data,
             )
@@ -555,7 +555,7 @@ class TradingBot:
                 self._log_strategy_control(
                     event="no_signal",
                     symbol=symbol,
-                    regime=regime,
+                    regime=effective_regime,
                     strategy=strategy_name,
                 )
                 continue
@@ -563,7 +563,7 @@ class TradingBot:
                 self._log_strategy_control(
                     event="filter_blocked",
                     symbol=symbol,
-                    regime=regime,
+                    regime=effective_regime,
                     strategy=strategy_name,
                 )
                 continue
@@ -571,7 +571,7 @@ class TradingBot:
             self._log_strategy_control(
                 event="signal_detected",
                 symbol=symbol,
-                regime=regime,
+                regime=effective_regime,
                 strategy=strategy_name,
                 asset_class=asset_class,
             )
@@ -642,7 +642,7 @@ class TradingBot:
                 stats = self.performance_tracker.get_strategy_stats(strategy_name_used)
                 opt_context = {
                     "strategy": strategy_name_used,
-                    "regime": regime,
+                    "regime": effective_regime,
                     "stats": stats if stats else {},
                     "atr": float(indicators.get("atr", 0)),
                     "atr_baseline": float(indicators.get("atr_baseline", indicators.get("atr_threshold", 0))),
@@ -760,7 +760,7 @@ class TradingBot:
                     'entry_signal': signal_details,
                     'buy_order': buy_order,
                     'strategy_name': strategy_name_used,
-                    'entry_regime': regime,
+                    'entry_regime': effective_regime,
                 }
 
                 executor = self.executors[symbol]
