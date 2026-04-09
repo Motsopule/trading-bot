@@ -511,8 +511,8 @@ class TradingBot:
 
         if not strategies:
             self._log_strategy_control(
-                "no_strategy",
-                symbol,
+                event="no_strategy",
+                symbol=symbol,
                 regime=regime,
                 strategy=None,
                 asset_class=asset_class,
@@ -526,8 +526,21 @@ class TradingBot:
             if executed >= MAX_STRATEGIES_PER_SYMBOL:
                 break
 
+            self._log_strategy_control(
+                event="strategy_attempt",
+                symbol=symbol,
+                regime=regime,
+                strategy=strategy_name,
+            )
+
             strategy_impl = load_strategy(strategy_name, self.strategy)
             if strategy_impl is None:
+                self._log_strategy_control(
+                    event="no_signal",
+                    symbol=symbol,
+                    regime=regime,
+                    strategy=strategy_name,
+                )
                 continue
 
             context = make_strategy_context(
@@ -539,19 +552,25 @@ class TradingBot:
             )
             signal = strategy_impl.generate(context)
             if not signal:
+                self._log_strategy_control(
+                    event="no_signal",
+                    symbol=symbol,
+                    regime=regime,
+                    strategy=strategy_name,
+                )
                 continue
             if not apply_filters(signal, context):
                 self._log_strategy_control(
-                    "filter_blocked",
-                    symbol,
+                    event="filter_blocked",
+                    symbol=symbol,
                     regime=regime,
                     strategy=strategy_name,
                 )
                 continue
 
             self._log_strategy_control(
-                "strategy_selected",
-                symbol,
+                event="signal_detected",
+                symbol=symbol,
                 regime=regime,
                 strategy=strategy_name,
                 asset_class=asset_class,
