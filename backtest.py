@@ -497,7 +497,7 @@ def run_backtest_with_ohlcv(
         # so we evaluate the strategy on every 4H candle and do not restrict
         # entries to a specific intraday session.
         if not in_position and not daily_loss_limit_hit:
-            long_entry_signal, long_details = strategy.check_entry_signal(
+            long_entry_signal, long_details, _ = strategy.check_entry_signal(
                 df_sorted.iloc[: i + 1]
             )
             short_entry_signal, short_details = strategy.check_short_entry_signal(

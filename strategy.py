@@ -179,7 +179,7 @@ class TradingStrategy:
         previous_df: Optional[pd.DataFrame] = None,
         symbol: Optional[str] = None,
         data_client: Optional[Any] = None,
-    ) -> Tuple[bool, Optional[Dict]]:
+    ) -> Tuple[bool, Optional[Dict], Optional[str]]:
         """
         Check if entry signal conditions are met.
         
@@ -197,10 +197,11 @@ class TradingStrategy:
             data_client: Optional data client for fetching daily klines
             
         Returns:
-            Tuple of (signal_present, signal_details)
+            Tuple of (signal_present, signal_details, failure_reason).
+            failure_reason is set when signal_present is False and a rule was evaluated.
         """
         if df is None or len(df) < 2:
-            return False, None
+            return False, None, None
         
         try:
             current = df.iloc[-1]
@@ -214,17 +215,17 @@ class TradingStrategy:
                 or pd.isna(previous.get('ma_20'))
                 or pd.isna(previous.get('ma_50'))
             ):
-                return False, None
+                return False, None, None
             atr = current.get('atr')
             if atr is None or pd.isna(atr) or not np.isfinite(atr) or atr <= 0:
-                return False, None
+                return False, None, None
             atr_ma = current.get('atr_ma')
             if atr_ma is None or pd.isna(atr_ma) or not np.isfinite(atr_ma) or atr_ma <= 0:
-                return False, None
+                return False, None, None
 
             rsi_val = current.get('rsi')
             if rsi_val is None or pd.isna(rsi_val) or not np.isfinite(rsi_val):
-                return False, None
+                return False, None, None
 
             # Trend filter: 50MA above 200MA on current closed candle
             trend_filter_ok = current['ma_50'] > current['ma_200']
@@ -257,7 +258,7 @@ class TradingStrategy:
                             "Daily trend check: symbol=%s trend=bearish — signal rejected",
                             symbol,
                         )
-                        return False, None
+                        return False, None, "daily_trend_bearish"
                     logger.debug(
                         "Daily trend check: symbol=%s trend=bullish",
                         symbol,
@@ -274,13 +275,23 @@ class TradingStrategy:
                 }
                 
                 logger.info("Entry signal detected")
-                return True, signal_details
+                return True, signal_details, None
             
-            return False, None
+            if not trend_filter_ok:
+                return False, None, "trend_filter_failed"
+            if not volatility_filter_ok:
+                return False, None, "volatility_not_expanded"
+            if not ma_bullish_cross:
+                return False, None, "no_ma_bullish_cross"
+            if not rsi_momentum_ok:
+                return False, None, "rsi_below_threshold"
+            if not breakout:
+                return False, None, "no_breakout"
+            return False, None, None
             
         except Exception as e:
             logger.error(f"Error checking entry signal: {e}")
-            return False, None
+            return False, None, None
 
     def check_short_entry_signal(
         self,

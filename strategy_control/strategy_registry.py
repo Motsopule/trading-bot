@@ -20,18 +20,21 @@ class TrendStrategyAdapter:
 
     def __init__(self, trading_engine: Any):
         self.engine = trading_engine
+        self._last_no_signal_reason: Optional[str] = None
 
     def generate(self, context) -> Optional[Dict]:
+        self._last_no_signal_reason = None
         df = context.price_data.get("df")
         if df is None or not isinstance(df, pd.DataFrame) or len(df) < 2:
             return None
         data_client = context.price_data.get("data_client")
-        ok, details = self.engine.check_entry_signal(
+        ok, details, fail_reason = self.engine.check_entry_signal(
             df,
             symbol=context.symbol,
             data_client=data_client,
         )
         if not ok or not details:
+            self._last_no_signal_reason = fail_reason
             return None
         return {"signal_details": details, "side": "LONG"}
 
@@ -41,8 +44,10 @@ class MeanReversionStrategyAdapter:
 
     def __init__(self, trading_engine: Any):
         self.engine = trading_engine
+        self._last_no_signal_reason: Optional[str] = None
 
     def generate(self, context) -> Optional[Dict]:
+        self._last_no_signal_reason = None
         df = context.price_data.get("df")
         if df is None or not isinstance(df, pd.DataFrame) or len(df) < 1:
             return None
@@ -75,6 +80,9 @@ class MeanReversionStrategyAdapter:
                 },
                 "side": "LONG",
             }
+        self._last_no_signal_reason = (
+            "rsi_not_oversold" if float(rsi) >= 35 else "close_not_below_ma50"
+        )
         return None
 
 

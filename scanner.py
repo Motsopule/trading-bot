@@ -83,7 +83,7 @@ def scan_markets(
                     continue
 
                 # Check long entry (with daily trend filter when data_fetcher provided)
-                long_signal, long_details = strategy.check_entry_signal(
+                long_signal, long_details, _ = strategy.check_entry_signal(
                     df, symbol=symbol, data_client=data_fetcher
                 )
                 if long_signal and long_details:

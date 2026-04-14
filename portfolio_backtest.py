@@ -282,7 +282,7 @@ def run_portfolio_backtest(
             if daily_loss_limit_hit:
                 continue
 
-            long_ok, long_details = strategy.check_entry_signal(df_slice)
+            long_ok, long_details, _ = strategy.check_entry_signal(df_slice)
             short_ok, short_details = strategy.check_short_entry_signal(
                 df_slice
             )

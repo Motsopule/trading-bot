@@ -32,6 +32,8 @@ logs/
 venv/
 ENV/
 env/
+.venv/
+.venv311/
 
 # IDE
 .vscode/
